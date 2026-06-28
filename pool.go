@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -18,6 +20,7 @@ type Pool struct {
 	timeout time.Duration
 	encode  func(any) ([]byte, error)
 	decode  func([]byte) (any, error)
+	logger  func(string)
 	wg      sync.WaitGroup
 	rwg     sync.WaitGroup
 }
@@ -49,7 +52,18 @@ func WithCodec(encode func(any) ([]byte, error), decode func([]byte) (any, error
 	}
 }
 
+// WithLogger sets a function to receive the startup info line.
+// Pass nil to silence it.
+func WithLogger(fn func(string)) Option {
+	return func(p *Pool) { p.logger = fn }
+}
+
 func NewPool(bufferSize int, process ProcessFunc, opts ...Option) *Pool {
+	cpus := runtime.NumCPU()
+	if bufferSize == 0 {
+		bufferSize = cpus * 10
+	}
+
 	p := &Pool{
 		jobs:    make(chan Task, bufferSize),
 		results: make(chan Result, bufferSize),
@@ -58,10 +72,11 @@ func NewPool(bufferSize int, process ProcessFunc, opts ...Option) *Pool {
 		policy:  DefaultRetryPolicy,
 		timeout: 30 * time.Second,
 		encode:  func(v any) ([]byte, error) { return json.Marshal(v) },
-		decode:  func(b []byte) (any, error) {
+		decode: func(b []byte) (any, error) {
 			var v any
 			return v, json.Unmarshal(b, &v)
 		},
+		logger: func(msg string) { fmt.Fprintln(os.Stderr, msg) },
 	}
 
 	for _, opt := range opts {
@@ -72,6 +87,22 @@ func NewPool(bufferSize int, process ProcessFunc, opts ...Option) *Pool {
 }
 
 func (p *Pool) Start(ctx context.Context, workerCount int) error {
+	if workerCount == 0 {
+		workerCount = runtime.NumCPU()
+	}
+
+	if p.logger != nil {
+		p.logger(fmt.Sprintf(
+			"[ember] workers=%d buffer=%d timeout=%s retries=%d delay=%s..%s",
+			workerCount,
+			cap(p.jobs),
+			p.timeout,
+			p.policy.MaxAttempts,
+			p.policy.BaseDelay,
+			p.policy.MaxDelay,
+		))
+	}
+
 	rawTasks, err := p.store.LoadPendingTasks()
 	if err != nil {
 		return fmt.Errorf("loading pending tasks: %w", err)
