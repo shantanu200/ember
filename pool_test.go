@@ -556,6 +556,51 @@ func TestLoggerDefaultOff(t *testing.T) {
 	// reaching here without panic is the assertion
 }
 
+// --- store encoding skip ---
+
+func TestNoStoreSkipsEncoding(t *testing.T) {
+	encodeCallCount := 0
+
+	pool := NewPool(1, func(_ context.Context, _ any) error { return nil },
+		WithRetryPolicy(fastPolicy(1)),
+		WithCodec(
+			func(v any) ([]byte, error) {
+				encodeCallCount++
+				return []byte(`"x"`), nil
+			},
+			func(b []byte) (any, error) { return "x", nil },
+		),
+	)
+	pool.Start(context.Background(), 1)
+	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
+
+	if encodeCallCount != 0 {
+		t.Errorf("encode called %d times with no store configured, want 0", encodeCallCount)
+	}
+}
+
+func TestWithStoreCallsEncoding(t *testing.T) {
+	encodeCallCount := 0
+
+	pool := NewPool(1, func(_ context.Context, _ any) error { return nil },
+		WithRetryPolicy(fastPolicy(1)),
+		WithStore(NoopStore{}),
+		WithCodec(
+			func(v any) ([]byte, error) {
+				encodeCallCount++
+				return []byte(`"x"`), nil
+			},
+			func(b []byte) (any, error) { return "x", nil },
+		),
+	)
+	pool.Start(context.Background(), 1)
+	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
+
+	if encodeCallCount == 0 {
+		t.Error("encode never called with store configured")
+	}
+}
+
 // --- EnqueuedAt auto-set ---
 
 func TestEnqueuedAtAutoSet(t *testing.T) {

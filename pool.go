@@ -11,18 +11,19 @@ import (
 )
 
 type Pool struct {
-	jobs    chan Task
-	results chan Result
-	store   Store
-	process ProcessFunc
-	policy  RetryPolicy
-	hooks   Hooks
-	timeout time.Duration
-	encode  func(any) ([]byte, error)
-	decode  func([]byte) (any, error)
-	logger  *slog.Logger
-	wg      sync.WaitGroup
-	rwg     sync.WaitGroup
+	jobs         chan Task
+	results      chan Result
+	store        Store
+	storeEnabled bool
+	process      ProcessFunc
+	policy       RetryPolicy
+	hooks        Hooks
+	timeout      time.Duration
+	encode       func(any) ([]byte, error)
+	decode       func([]byte) (any, error)
+	logger       *slog.Logger
+	wg           sync.WaitGroup
+	rwg          sync.WaitGroup
 }
 
 type ProcessFunc func(ctx context.Context, payload any) error
@@ -30,7 +31,10 @@ type ProcessFunc func(ctx context.Context, payload any) error
 type Option func(*Pool)
 
 func WithStore(s Store) Option {
-	return func(p *Pool) { p.store = s }
+	return func(p *Pool) {
+		p.store = s
+		p.storeEnabled = true
+	}
 }
 
 func WithRetryPolicy(r RetryPolicy) Option {
@@ -107,22 +111,23 @@ func (p *Pool) Start(ctx context.Context, workerCount int) error {
 		"max_delay", p.policy.MaxDelay,
 	)
 
-	rawTasks, err := p.store.LoadPendingTasks()
-	if err != nil {
-		return fmt.Errorf("loading pending tasks: %w", err)
-	}
-
 	for i := 0; i < workerCount; i++ {
 		p.wg.Add(1)
 		go p.worker(ctx)
 	}
 
-	for _, r := range rawTasks {
-		payload, err := p.decode(r.Payload)
+	if p.storeEnabled {
+		rawTasks, err := p.store.LoadPendingTasks()
 		if err != nil {
-			return fmt.Errorf("decoding pending task %s: %w", r.ID, err)
+			return fmt.Errorf("loading pending tasks: %w", err)
 		}
-		p.jobs <- Task{ID: r.ID, Payload: payload, EnqueuedAt: r.EnqueuedAt, Attempt: r.Attempt}
+		for _, r := range rawTasks {
+			payload, err := p.decode(r.Payload)
+			if err != nil {
+				return fmt.Errorf("decoding pending task %s: %w", r.ID, err)
+			}
+			p.jobs <- Task{ID: r.ID, Payload: payload, EnqueuedAt: r.EnqueuedAt, Attempt: r.Attempt}
+		}
 	}
 
 	return nil
@@ -133,14 +138,15 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		t.EnqueuedAt = time.Now()
 	}
 
-	encoded, err := p.encode(t.Payload)
-	if err != nil {
-		return fmt.Errorf("encoding payload for task %s: %w", t.ID, err)
-	}
-
-	raw := RawTask{ID: t.ID, Payload: encoded, EnqueuedAt: t.EnqueuedAt, Attempt: t.Attempt}
-	if err := p.store.SaveTask(raw); err != nil {
-		return fmt.Errorf("persisting task %s: %w", t.ID, err)
+	if p.storeEnabled {
+		encoded, err := p.encode(t.Payload)
+		if err != nil {
+			return fmt.Errorf("encoding payload for task %s: %w", t.ID, err)
+		}
+		raw := RawTask{ID: t.ID, Payload: encoded, EnqueuedAt: t.EnqueuedAt, Attempt: t.Attempt}
+		if err := p.store.SaveTask(raw); err != nil {
+			return fmt.Errorf("persisting task %s: %w", t.ID, err)
+		}
 	}
 
 	select {
@@ -183,8 +189,10 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 	p.log(slog.LevelDebug, "task started", "task_id", task.ID)
 	err := p.runWithRetry(ctx, &task)
 
-	if delErr := p.store.DeleteTask(task.ID); delErr != nil && p.hooks.OnStoreError != nil {
-		p.hooks.OnStoreError(fmt.Errorf("deleting completed task %s: %w", task.ID, delErr))
+	if p.storeEnabled {
+		if delErr := p.store.DeleteTask(task.ID); delErr != nil && p.hooks.OnStoreError != nil {
+			p.hooks.OnStoreError(fmt.Errorf("deleting completed task %s: %w", task.ID, delErr))
+		}
 	}
 
 	if err != nil {
@@ -195,15 +203,17 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 			FailedAt:  time.Now(),
 		}
 
-		encoded, _ := p.encode(task.Payload)
-		raw := RawDeadLetter{
-			Task:      RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
-			Err:       dl.Err,
-			Permanent: dl.Permanent,
-			FailedAt:  dl.FailedAt,
-		}
-		if saveErr := p.store.SaveDeadLetter(raw); saveErr != nil && p.hooks.OnStoreError != nil {
-			p.hooks.OnStoreError(fmt.Errorf("saving dead letter for task %s: %w", task.ID, saveErr))
+		if p.storeEnabled {
+			encoded, _ := p.encode(task.Payload)
+			raw := RawDeadLetter{
+				Task:      RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+				Err:       dl.Err,
+				Permanent: dl.Permanent,
+				FailedAt:  dl.FailedAt,
+			}
+			if saveErr := p.store.SaveDeadLetter(raw); saveErr != nil && p.hooks.OnStoreError != nil {
+				p.hooks.OnStoreError(fmt.Errorf("saving dead letter for task %s: %w", task.ID, saveErr))
+			}
 		}
 
 		p.log(slog.LevelWarn, "task dead-lettered",
