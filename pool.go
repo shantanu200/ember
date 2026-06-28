@@ -2,6 +2,7 @@ package ember
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -10,20 +11,22 @@ import (
 type Pool[T any] struct {
 	jobs    chan Task[T]
 	results chan Result[T]
-	store   Store[T]
+	store   Store
 	process ProcessFunc[T]
 	policy  RetryPolicy
 	hooks   Hooks[T]
 	timeout time.Duration
+	encode  func(T) ([]byte, error)
+	decode  func([]byte) (T, error)
 	wg      sync.WaitGroup
-	rwg     sync.WaitGroup // tracks in-flight result sends
+	rwg     sync.WaitGroup
 }
 
 type ProcessFunc[T any] func(ctx context.Context, payload T) error
 
 type Option[T any] func(*Pool[T])
 
-func WithStore[T any](s Store[T]) Option[T] {
+func WithStore[T any](s Store) Option[T] {
 	return func(p *Pool[T]) { p.store = s }
 }
 
@@ -39,14 +42,26 @@ func WithTaskTimeout[T any](d time.Duration) Option[T] {
 	return func(p *Pool[T]) { p.timeout = d }
 }
 
+func WithCodec[T any](encode func(T) ([]byte, error), decode func([]byte) (T, error)) Option[T] {
+	return func(p *Pool[T]) {
+		p.encode = encode
+		p.decode = decode
+	}
+}
+
 func NewPool[T any](bufferSize int, process ProcessFunc[T], opts ...Option[T]) *Pool[T] {
 	p := &Pool[T]{
 		jobs:    make(chan Task[T], bufferSize),
 		results: make(chan Result[T], bufferSize),
-		store:   NoopStore[T]{},
+		store:   NoopStore{},
 		process: process,
 		policy:  DefaultRetryPolicy,
 		timeout: 30 * time.Second,
+		encode:  func(t T) ([]byte, error) { return json.Marshal(t) },
+		decode: func(b []byte) (T, error) {
+			var t T
+			return t, json.Unmarshal(b, &t)
+		},
 	}
 
 	for _, opt := range opts {
@@ -57,7 +72,7 @@ func NewPool[T any](bufferSize int, process ProcessFunc[T], opts ...Option[T]) *
 }
 
 func (p *Pool[T]) Start(ctx context.Context, workerCount int) error {
-	pending, err := p.store.LoadPendingTasks()
+	rawTasks, err := p.store.LoadPendingTasks()
 	if err != nil {
 		return fmt.Errorf("loading pending tasks: %w", err)
 	}
@@ -67,8 +82,12 @@ func (p *Pool[T]) Start(ctx context.Context, workerCount int) error {
 		go p.worker(ctx)
 	}
 
-	for _, t := range pending {
-		p.jobs <- t
+	for _, r := range rawTasks {
+		payload, err := p.decode(r.Payload)
+		if err != nil {
+			return fmt.Errorf("decoding pending task %s: %w", r.ID, err)
+		}
+		p.jobs <- Task[T]{ID: r.ID, Payload: payload, EnqueuedAt: r.EnqueuedAt, Attempt: r.Attempt}
 	}
 
 	return nil
@@ -79,7 +98,13 @@ func (p *Pool[T]) Submit(ctx context.Context, t Task[T]) error {
 		t.EnqueuedAt = time.Now()
 	}
 
-	if err := p.store.SaveTask(t); err != nil {
+	encoded, err := p.encode(t.Payload)
+	if err != nil {
+		return fmt.Errorf("encoding payload for task %s: %w", t.ID, err)
+	}
+
+	raw := RawTask{ID: t.ID, Payload: encoded, EnqueuedAt: t.EnqueuedAt, Attempt: t.Attempt}
+	if err := p.store.SaveTask(raw); err != nil {
 		return fmt.Errorf("persisting task %s: %w", t.ID, err)
 	}
 
@@ -131,7 +156,15 @@ func (p *Pool[T]) handle(ctx context.Context, task Task[T]) {
 			Permanent: IsPermanent(err),
 			FailedAt:  time.Now(),
 		}
-		if saveErr := p.store.SaveDeadLetter(dl); saveErr != nil && p.hooks.OnStoreError != nil {
+
+		encoded, _ := p.encode(task.Payload)
+		raw := RawDeadLetter{
+			Task:      RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+			Err:       dl.Err,
+			Permanent: dl.Permanent,
+			FailedAt:  dl.FailedAt,
+		}
+		if saveErr := p.store.SaveDeadLetter(raw); saveErr != nil && p.hooks.OnStoreError != nil {
 			p.hooks.OnStoreError(fmt.Errorf("saving dead letter for task %s: %w", task.ID, saveErr))
 		}
 
