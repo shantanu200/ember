@@ -23,7 +23,6 @@ type Pool struct {
 	decode       func([]byte) (any, error)
 	logger       *slog.Logger
 	wg           sync.WaitGroup
-	rwg          sync.WaitGroup
 }
 
 type ProcessFunc func(ctx context.Context, payload any) error
@@ -151,7 +150,9 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 
 	select {
 	case p.jobs <- t:
-		p.log(slog.LevelDebug, "task submitted", "task_id", t.ID)
+		if p.logger != nil {
+			p.log(slog.LevelDebug, "task submitted", "task_id", t.ID)
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -167,7 +168,6 @@ func (p *Pool) Results() <-chan Result {
 func (p *Pool) CloseAndWait() {
 	close(p.jobs)
 	p.wg.Wait()
-	p.rwg.Wait()
 	close(p.results)
 }
 
@@ -188,7 +188,9 @@ func (p *Pool) worker(ctx context.Context) {
 
 func (p *Pool) handle(ctx context.Context, task Task) {
 	start := time.Now()
-	p.log(slog.LevelDebug, "task started", "task_id", task.ID)
+	if p.logger != nil {
+		p.log(slog.LevelDebug, "task started", "task_id", task.ID)
+	}
 	err := p.runWithRetry(ctx, &task)
 
 	if p.storeEnabled {
@@ -229,21 +231,19 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 			p.hooks.OnDeadLetter(dl)
 		}
 	} else {
-		p.log(slog.LevelDebug, "task succeeded",
-			"task_id", task.ID,
-			"attempts", task.Attempt+1,
-			"elapsed", time.Since(start),
-		)
+		if p.logger != nil {
+			p.log(slog.LevelDebug, "task succeeded",
+				"task_id", task.ID,
+				"attempts", task.Attempt+1,
+				"elapsed", time.Since(start),
+			)
+		}
 		if p.hooks.OnSuccess != nil {
 			p.hooks.OnSuccess(task)
 		}
 	}
 
-	p.rwg.Add(1)
-	go func() {
-		defer p.rwg.Done()
-		p.results <- Result{Task: task, Err: err}
-	}()
+	p.results <- Result{Task: task, Err: err}
 }
 
 func (p *Pool) runWithRetry(ctx context.Context, task *Task) error {
@@ -270,36 +270,26 @@ func (p *Pool) runWithRetry(ctx context.Context, task *Task) error {
 			p.hooks.OnRetry(*task, err, attempt)
 		}
 
-		timer := time.NewTimer(p.policy.Delay(attempt))
+		delay := p.policy.Delay(attempt)
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return ctx.Err()
-		case <-timer.C:
+		case <-time.After(delay):
 		}
 	}
 
 	return fmt.Errorf("after %d attempts: %w", p.policy.MaxAttempts, err)
 }
 
-func (p *Pool) runOnce(parent context.Context, payload any) error {
+func (p *Pool) runOnce(parent context.Context, payload any) (err error) {
 	ctx, cancel := context.WithTimeout(parent, p.timeout)
 	defer cancel()
 
-	done := make(chan error, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				done <- fmt.Errorf("panic: %v", r)
-			}
-		}()
-		done <- p.process(ctx, payload)
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
 	}()
 
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return fmt.Errorf("task timed out: %w", ctx.Err())
-	}
+	return p.process(ctx, payload)
 }
