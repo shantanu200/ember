@@ -1,8 +1,8 @@
 package ember
 
-type Hooks[T any] struct {
-	OnSuccess    func(Task[T])
-	OnRetry      func(task Task[T], err error, attempt int)
-	OnDeadLetter func(DeadLetter[T])
+type Hooks struct {
+	OnSuccess    func(Task)
+	OnRetry      func(task Task, err error, attempt int)
+	OnDeadLetter func(DeadLetter)
 	OnStoreError func(err error)
 }

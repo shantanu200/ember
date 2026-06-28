@@ -8,59 +8,59 @@ import (
 	"time"
 )
 
-type Pool[T any] struct {
-	jobs    chan Task[T]
-	results chan Result[T]
+type Pool struct {
+	jobs    chan Task
+	results chan Result
 	store   Store
-	process ProcessFunc[T]
+	process ProcessFunc
 	policy  RetryPolicy
-	hooks   Hooks[T]
+	hooks   Hooks
 	timeout time.Duration
-	encode  func(T) ([]byte, error)
-	decode  func([]byte) (T, error)
+	encode  func(any) ([]byte, error)
+	decode  func([]byte) (any, error)
 	wg      sync.WaitGroup
 	rwg     sync.WaitGroup
 }
 
-type ProcessFunc[T any] func(ctx context.Context, payload T) error
+type ProcessFunc func(ctx context.Context, payload any) error
 
-type Option[T any] func(*Pool[T])
+type Option func(*Pool)
 
-func WithStore[T any](s Store) Option[T] {
-	return func(p *Pool[T]) { p.store = s }
+func WithStore(s Store) Option {
+	return func(p *Pool) { p.store = s }
 }
 
-func WithRetryPolicy[T any](r RetryPolicy) Option[T] {
-	return func(p *Pool[T]) { p.policy = r }
+func WithRetryPolicy(r RetryPolicy) Option {
+	return func(p *Pool) { p.policy = r }
 }
 
-func WithHooks[T any](h Hooks[T]) Option[T] {
-	return func(p *Pool[T]) { p.hooks = h }
+func WithHooks(h Hooks) Option {
+	return func(p *Pool) { p.hooks = h }
 }
 
-func WithTaskTimeout[T any](d time.Duration) Option[T] {
-	return func(p *Pool[T]) { p.timeout = d }
+func WithTaskTimeout(d time.Duration) Option {
+	return func(p *Pool) { p.timeout = d }
 }
 
-func WithCodec[T any](encode func(T) ([]byte, error), decode func([]byte) (T, error)) Option[T] {
-	return func(p *Pool[T]) {
+func WithCodec(encode func(any) ([]byte, error), decode func([]byte) (any, error)) Option {
+	return func(p *Pool) {
 		p.encode = encode
 		p.decode = decode
 	}
 }
 
-func NewPool[T any](bufferSize int, process ProcessFunc[T], opts ...Option[T]) *Pool[T] {
-	p := &Pool[T]{
-		jobs:    make(chan Task[T], bufferSize),
-		results: make(chan Result[T], bufferSize),
+func NewPool(bufferSize int, process ProcessFunc, opts ...Option) *Pool {
+	p := &Pool{
+		jobs:    make(chan Task, bufferSize),
+		results: make(chan Result, bufferSize),
 		store:   NoopStore{},
 		process: process,
 		policy:  DefaultRetryPolicy,
 		timeout: 30 * time.Second,
-		encode:  func(t T) ([]byte, error) { return json.Marshal(t) },
-		decode: func(b []byte) (T, error) {
-			var t T
-			return t, json.Unmarshal(b, &t)
+		encode:  func(v any) ([]byte, error) { return json.Marshal(v) },
+		decode:  func(b []byte) (any, error) {
+			var v any
+			return v, json.Unmarshal(b, &v)
 		},
 	}
 
@@ -71,7 +71,7 @@ func NewPool[T any](bufferSize int, process ProcessFunc[T], opts ...Option[T]) *
 	return p
 }
 
-func (p *Pool[T]) Start(ctx context.Context, workerCount int) error {
+func (p *Pool) Start(ctx context.Context, workerCount int) error {
 	rawTasks, err := p.store.LoadPendingTasks()
 	if err != nil {
 		return fmt.Errorf("loading pending tasks: %w", err)
@@ -87,13 +87,13 @@ func (p *Pool[T]) Start(ctx context.Context, workerCount int) error {
 		if err != nil {
 			return fmt.Errorf("decoding pending task %s: %w", r.ID, err)
 		}
-		p.jobs <- Task[T]{ID: r.ID, Payload: payload, EnqueuedAt: r.EnqueuedAt, Attempt: r.Attempt}
+		p.jobs <- Task{ID: r.ID, Payload: payload, EnqueuedAt: r.EnqueuedAt, Attempt: r.Attempt}
 	}
 
 	return nil
 }
 
-func (p *Pool[T]) Submit(ctx context.Context, t Task[T]) error {
+func (p *Pool) Submit(ctx context.Context, t Task) error {
 	if t.EnqueuedAt.IsZero() {
 		t.EnqueuedAt = time.Now()
 	}
@@ -116,18 +116,18 @@ func (p *Pool[T]) Submit(ctx context.Context, t Task[T]) error {
 	}
 }
 
-func (p *Pool[T]) Results() <-chan Result[T] {
+func (p *Pool) Results() <-chan Result {
 	return p.results
 }
 
-func (p *Pool[T]) CloseAndWait() {
+func (p *Pool) CloseAndWait() {
 	close(p.jobs)
 	p.wg.Wait()
 	p.rwg.Wait()
 	close(p.results)
 }
 
-func (p *Pool[T]) worker(ctx context.Context) {
+func (p *Pool) worker(ctx context.Context) {
 	defer p.wg.Done()
 	for {
 		select {
@@ -142,7 +142,7 @@ func (p *Pool[T]) worker(ctx context.Context) {
 	}
 }
 
-func (p *Pool[T]) handle(ctx context.Context, task Task[T]) {
+func (p *Pool) handle(ctx context.Context, task Task) {
 	err := p.runWithRetry(ctx, &task)
 
 	if delErr := p.store.DeleteTask(task.ID); delErr != nil && p.hooks.OnStoreError != nil {
@@ -150,7 +150,7 @@ func (p *Pool[T]) handle(ctx context.Context, task Task[T]) {
 	}
 
 	if err != nil {
-		dl := DeadLetter[T]{
+		dl := DeadLetter{
 			Task:      task,
 			Err:       err.Error(),
 			Permanent: IsPermanent(err),
@@ -178,11 +178,11 @@ func (p *Pool[T]) handle(ctx context.Context, task Task[T]) {
 	p.rwg.Add(1)
 	go func() {
 		defer p.rwg.Done()
-		p.results <- Result[T]{Task: task, Err: err}
+		p.results <- Result{Task: task, Err: err}
 	}()
 }
 
-func (p *Pool[T]) runWithRetry(ctx context.Context, task *Task[T]) error {
+func (p *Pool) runWithRetry(ctx context.Context, task *Task) error {
 	var err error
 
 	for attempt := 0; attempt < p.policy.MaxAttempts; attempt++ {
@@ -212,7 +212,7 @@ func (p *Pool[T]) runWithRetry(ctx context.Context, task *Task[T]) error {
 	return fmt.Errorf("after %d attempts: %w", p.policy.MaxAttempts, err)
 }
 
-func (p *Pool[T]) runOnce(parent context.Context, payload T) error {
+func (p *Pool) runOnce(parent context.Context, payload any) error {
 	ctx, cancel := context.WithTimeout(parent, p.timeout)
 	defer cancel()
 

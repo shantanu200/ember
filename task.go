@@ -2,20 +2,20 @@ package ember
 
 import "time"
 
-type Task[T any] struct {
+type Task struct {
 	ID         string
-	Payload    T
+	Payload    any
 	EnqueuedAt time.Time
 	Attempt    int
 }
 
-type Result[T any] struct {
-	Task Task[T]
+type Result struct {
+	Task Task
 	Err  error
 }
 
-type DeadLetter[T any] struct {
-	Task      Task[T]
+type DeadLetter struct {
+	Task      Task
 	Err       string
 	Permanent bool
 	FailedAt  time.Time
