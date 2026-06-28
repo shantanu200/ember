@@ -4,11 +4,76 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// collectingHandler captures slog records for test assertions.
+type collectingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *collectingHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+func (h *collectingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	h.records = append(h.records, r.Clone())
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *collectingHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *collectingHandler) WithGroup(_ string) slog.Handler      { return h }
+
+func (h *collectingHandler) messages() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	msgs := make([]string, len(h.records))
+	for i, r := range h.records {
+		msgs[i] = r.Message
+	}
+	return msgs
+}
+
+func (h *collectingHandler) hasMessage(msg string) bool {
+	for _, m := range h.messages() {
+		if m == msg {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *collectingHandler) attrFor(msg, key string) (string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Message != msg {
+			continue
+		}
+		var found string
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == key {
+				found = a.Value.String()
+				return false
+			}
+			return true
+		})
+		if found != "" {
+			return found, true
+		}
+	}
+	return "", false
+}
+
+func newTestLogger() (*collectingHandler, *slog.Logger) {
+	h := &collectingHandler{}
+	return h, slog.New(h)
+}
 
 func fastPolicy(attempts int) RetryPolicy {
 	return RetryPolicy{MaxAttempts: attempts, BaseDelay: 0, MaxDelay: 0}
@@ -378,6 +443,117 @@ func TestConcurrentStreamSubmit(t *testing.T) {
 	if len(results) != n {
 		t.Errorf("got %d results, want %d", len(results), n)
 	}
+}
+
+// --- logger ---
+
+func TestLoggerStartup(t *testing.T) {
+	h, logger := newTestLogger()
+
+	pool := NewPool(0, func(_ context.Context, _ any) error { return nil },
+		WithLogger(logger),
+		WithRetryPolicy(fastPolicy(1)),
+	)
+	if err := pool.Start(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	pool.CloseAndWait()
+	// drain results
+	for range pool.Results() {
+	}
+
+	if !h.hasMessage("ember started") {
+		t.Fatalf("expected 'ember started' log; got %v", h.messages())
+	}
+	if v, ok := h.attrFor("ember started", "workers"); !ok || v != "2" {
+		t.Errorf("expected workers=2, got %q (ok=%v)", v, ok)
+	}
+}
+
+func TestLoggerTaskLifecycle(t *testing.T) {
+	h, logger := newTestLogger()
+
+	pool := NewPool(1, func(_ context.Context, _ any) error { return nil },
+		WithLogger(logger),
+		WithRetryPolicy(fastPolicy(1)),
+	)
+	pool.Start(context.Background(), 1)
+	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
+
+	for _, want := range []string{"task submitted", "task started", "task succeeded"} {
+		if !h.hasMessage(want) {
+			t.Errorf("missing log message %q; got %v", want, h.messages())
+		}
+	}
+	if v, ok := h.attrFor("task submitted", "task_id"); !ok || v != "t1" {
+		t.Errorf("task submitted: expected task_id=t1, got %q", v)
+	}
+	if v, ok := h.attrFor("task succeeded", "task_id"); !ok || v != "t1" {
+		t.Errorf("task succeeded: expected task_id=t1, got %q", v)
+	}
+}
+
+func TestLoggerRetry(t *testing.T) {
+	h, logger := newTestLogger()
+	var attempts atomic.Int64
+
+	pool := NewPool(1, func(_ context.Context, _ any) error {
+		if attempts.Add(1) < 3 {
+			return errors.New("transient")
+		}
+		return nil
+	},
+		WithLogger(logger),
+		WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}),
+	)
+	pool.Start(context.Background(), 1)
+	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
+
+	if !h.hasMessage("task retrying") {
+		t.Fatalf("expected 'task retrying' log; got %v", h.messages())
+	}
+	// two retries before success
+	h.mu.Lock()
+	var retryCount int
+	for _, r := range h.records {
+		if r.Message == "task retrying" {
+			retryCount++
+		}
+	}
+	h.mu.Unlock()
+	if retryCount != 2 {
+		t.Errorf("expected 2 'task retrying' records, got %d", retryCount)
+	}
+}
+
+func TestLoggerDeadLetter(t *testing.T) {
+	h, logger := newTestLogger()
+
+	pool := NewPool(1, func(_ context.Context, _ any) error {
+		return errors.New("always fails")
+	},
+		WithLogger(logger),
+		WithRetryPolicy(fastPolicy(1)),
+	)
+	pool.Start(context.Background(), 1)
+	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
+
+	if !h.hasMessage("task dead-lettered") {
+		t.Fatalf("expected 'task dead-lettered' log; got %v", h.messages())
+	}
+	if v, ok := h.attrFor("task dead-lettered", "task_id"); !ok || v != "t1" {
+		t.Errorf("dead-letter: expected task_id=t1, got %q", v)
+	}
+}
+
+func TestLoggerDefaultOff(t *testing.T) {
+	// nil logger (default) must not panic and produce no output
+	pool := NewPool(1, func(_ context.Context, _ any) error { return nil },
+		WithRetryPolicy(fastPolicy(1)),
+	)
+	pool.Start(context.Background(), 1)
+	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
+	// reaching here without panic is the assertion
 }
 
 // --- EnqueuedAt auto-set ---

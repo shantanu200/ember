@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
+	"log/slog"
 	"runtime"
 	"sync"
 	"time"
@@ -20,7 +20,7 @@ type Pool struct {
 	timeout time.Duration
 	encode  func(any) ([]byte, error)
 	decode  func([]byte) (any, error)
-	logger  func(string)
+	logger  *slog.Logger
 	wg      sync.WaitGroup
 	rwg     sync.WaitGroup
 }
@@ -52,10 +52,17 @@ func WithCodec(encode func(any) ([]byte, error), decode func([]byte) (any, error
 	}
 }
 
-// WithLogger sets a function to receive the startup info line.
-// Pass nil to silence it.
-func WithLogger(fn func(string)) Option {
-	return func(p *Pool) { p.logger = fn }
+// WithLogger attaches a *slog.Logger for execution tracing.
+// By default the pool logs nothing; pass slog.Default() or a custom logger to enable.
+func WithLogger(l *slog.Logger) Option {
+	return func(p *Pool) { p.logger = l }
+}
+
+func (p *Pool) log(level slog.Level, msg string, args ...any) {
+	if p.logger == nil {
+		return
+	}
+	p.logger.Log(context.Background(), level, msg, args...)
 }
 
 func NewPool(bufferSize int, process ProcessFunc, opts ...Option) *Pool {
@@ -76,7 +83,7 @@ func NewPool(bufferSize int, process ProcessFunc, opts ...Option) *Pool {
 			var v any
 			return v, json.Unmarshal(b, &v)
 		},
-		logger: func(msg string) { fmt.Fprintln(os.Stderr, msg) },
+		logger: nil,
 	}
 
 	for _, opt := range opts {
@@ -91,17 +98,14 @@ func (p *Pool) Start(ctx context.Context, workerCount int) error {
 		workerCount = runtime.NumCPU()
 	}
 
-	if p.logger != nil {
-		p.logger(fmt.Sprintf(
-			"[ember] workers=%d buffer=%d timeout=%s retries=%d delay=%s..%s",
-			workerCount,
-			cap(p.jobs),
-			p.timeout,
-			p.policy.MaxAttempts,
-			p.policy.BaseDelay,
-			p.policy.MaxDelay,
-		))
-	}
+	p.log(slog.LevelInfo, "ember started",
+		"workers", workerCount,
+		"buffer", cap(p.jobs),
+		"timeout", p.timeout,
+		"max_attempts", p.policy.MaxAttempts,
+		"base_delay", p.policy.BaseDelay,
+		"max_delay", p.policy.MaxDelay,
+	)
 
 	rawTasks, err := p.store.LoadPendingTasks()
 	if err != nil {
@@ -141,6 +145,7 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 
 	select {
 	case p.jobs <- t:
+		p.log(slog.LevelDebug, "task submitted", "task_id", t.ID)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -174,6 +179,8 @@ func (p *Pool) worker(ctx context.Context) {
 }
 
 func (p *Pool) handle(ctx context.Context, task Task) {
+	start := time.Now()
+	p.log(slog.LevelDebug, "task started", "task_id", task.ID)
 	err := p.runWithRetry(ctx, &task)
 
 	if delErr := p.store.DeleteTask(task.ID); delErr != nil && p.hooks.OnStoreError != nil {
@@ -199,11 +206,25 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 			p.hooks.OnStoreError(fmt.Errorf("saving dead letter for task %s: %w", task.ID, saveErr))
 		}
 
+		p.log(slog.LevelWarn, "task dead-lettered",
+			"task_id", task.ID,
+			"attempts", task.Attempt+1,
+			"permanent", dl.Permanent,
+			"error", dl.Err,
+			"elapsed", time.Since(start),
+		)
 		if p.hooks.OnDeadLetter != nil {
 			p.hooks.OnDeadLetter(dl)
 		}
-	} else if p.hooks.OnSuccess != nil {
-		p.hooks.OnSuccess(task)
+	} else {
+		p.log(slog.LevelDebug, "task succeeded",
+			"task_id", task.ID,
+			"attempts", task.Attempt+1,
+			"elapsed", time.Since(start),
+		)
+		if p.hooks.OnSuccess != nil {
+			p.hooks.OnSuccess(task)
+		}
 	}
 
 	p.rwg.Add(1)
@@ -227,6 +248,12 @@ func (p *Pool) runWithRetry(ctx context.Context, task *Task) error {
 			return err
 		}
 
+		p.log(slog.LevelWarn, "task retrying",
+			"task_id", task.ID,
+			"attempt", attempt+1,
+			"max_attempts", p.policy.MaxAttempts,
+			"error", err,
+		)
 		if p.hooks.OnRetry != nil {
 			p.hooks.OnRetry(*task, err, attempt)
 		}
