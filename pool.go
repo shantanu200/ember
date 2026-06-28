@@ -16,6 +16,7 @@ type Pool[T any] struct {
 	hooks   Hooks[T]
 	timeout time.Duration
 	wg      sync.WaitGroup
+	rwg     sync.WaitGroup // tracks in-flight result sends
 }
 
 type ProcessFunc[T any] func(ctx context.Context, payload T) error
@@ -61,19 +62,19 @@ func (p *Pool[T]) Start(ctx context.Context, workerCount int) error {
 		return fmt.Errorf("loading pending tasks: %w", err)
 	}
 
-	for _, t := range pending {
-		p.jobs <- t
-	}
-
 	for i := 0; i < workerCount; i++ {
 		p.wg.Add(1)
 		go p.worker(ctx)
 	}
 
+	for _, t := range pending {
+		p.jobs <- t
+	}
+
 	return nil
 }
 
-func (p *Pool[T]) Submit(t Task[T]) error {
+func (p *Pool[T]) Submit(ctx context.Context, t Task[T]) error {
 	if t.EnqueuedAt.IsZero() {
 		t.EnqueuedAt = time.Now()
 	}
@@ -82,8 +83,12 @@ func (p *Pool[T]) Submit(t Task[T]) error {
 		return fmt.Errorf("persisting task %s: %w", t.ID, err)
 	}
 
-	p.jobs <- t
-	return nil
+	select {
+	case p.jobs <- t:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (p *Pool[T]) Results() <-chan Result[T] {
@@ -93,6 +98,7 @@ func (p *Pool[T]) Results() <-chan Result[T] {
 func (p *Pool[T]) CloseAndWait() {
 	close(p.jobs)
 	p.wg.Wait()
+	p.rwg.Wait()
 	close(p.results)
 }
 
@@ -136,7 +142,11 @@ func (p *Pool[T]) handle(ctx context.Context, task Task[T]) {
 		p.hooks.OnSuccess(task)
 	}
 
-	p.results <- Result[T]{Task: task, Err: err}
+	p.rwg.Add(1)
+	go func() {
+		defer p.rwg.Done()
+		p.results <- Result[T]{Task: task, Err: err}
+	}()
 }
 
 func (p *Pool[T]) runWithRetry(ctx context.Context, task *Task[T]) error {
@@ -157,10 +167,12 @@ func (p *Pool[T]) runWithRetry(ctx context.Context, task *Task[T]) error {
 			p.hooks.OnRetry(*task, err, attempt)
 		}
 
+		timer := time.NewTimer(p.policy.Delay(attempt))
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-time.After(p.policy.Delay(attempt)):
+		case <-timer.C:
 		}
 	}
 

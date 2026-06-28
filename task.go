@@ -15,10 +15,8 @@ type Result[T any] struct {
 }
 
 type DeadLetter[T any] struct {
-	Task        Task[T]
-	Err         string
-	Permanent   bool
-	FailedAt    time.Time
-	ReplayCount int
-	LastReplay  time.Time
+	Task      Task[T]
+	Err       string
+	Permanent bool
+	FailedAt  time.Time
 }

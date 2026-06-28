@@ -37,7 +37,7 @@ func submitAndClose[T any](t *testing.T, p *Pool[T], tasks []Task[T]) []Result[T
 	}()
 
 	for _, task := range tasks {
-		if err := p.Submit(task); err != nil {
+		if err := p.Submit(context.Background(), task); err != nil {
 			t.Fatalf("Submit(%s): %v", task.ID, err)
 		}
 	}
@@ -151,7 +151,7 @@ func TestPermanentErrorSkipsRetries(t *testing.T) {
 
 	pool := NewPool[string](1, func(_ context.Context, _ string) error {
 		attempts.Add(1)
-		return NewPermanantError(errors.New("fatal"))
+		return NewPermanentError(errors.New("fatal"))
 	}, WithRetryPolicy[string](RetryPolicy{MaxAttempts: 5, BaseDelay: 0, MaxDelay: 0}))
 
 	pool.Start(context.Background(), 1)
@@ -169,7 +169,7 @@ func TestPermanentErrorMarkedInDeadLetter(t *testing.T) {
 	var dl DeadLetter[string]
 	pool := NewPool[string](
 		1, func(_ context.Context, _ string) error {
-			return NewPermanantError(errors.New("fatal"))
+			return NewPermanentError(errors.New("fatal"))
 		},
 		WithRetryPolicy[string](fastPolicy(1)),
 		WithHooks[string](Hooks[string]{
@@ -278,7 +278,7 @@ func TestContextCancellationStopsWorkers(t *testing.T) {
 
 	// Submit tasks then cancel before they finish
 	for _, task := range makeTasks(10) {
-		pool.Submit(task)
+		pool.Submit(ctx, task)
 	}
 
 	// Wait until at least one worker picks something up
@@ -366,7 +366,7 @@ func TestConcurrentStreamSubmit(t *testing.T) {
 			defer producers.Done()
 			for j := range n / 4 {
 				id := offset*25 + j
-				pool.Submit(Task[int]{ID: fmt.Sprintf("task-%d", id), Payload: id})
+				pool.Submit(context.Background(), Task[int]{ID: fmt.Sprintf("task-%d", id), Payload: id})
 			}
 		}(i)
 	}

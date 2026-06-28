@@ -23,7 +23,7 @@ func (e *PermanentError) Unwrap() error {
 	return e.Err
 }
 
-func NewPermanantError(err error) *PermanentError {
+func NewPermanentError(err error) *PermanentError {
 	return &PermanentError{
 		Err: err,
 	}
@@ -45,8 +45,11 @@ func (r RetryPolicy) Delay(attempt int) time.Duration {
 		attempt = 0
 	}
 
-	d := r.BaseDelay << time.Duration(attempt)
-	if d <= 0 || d > r.MaxDelay {
+	d := r.BaseDelay << uint(attempt)
+	if d <= 0 {
+		return r.MaxDelay
+	}
+	if r.MaxDelay > 0 && d > r.MaxDelay {
 		return r.MaxDelay
 	}
 
