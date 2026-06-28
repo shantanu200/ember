@@ -155,6 +155,8 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	default:
+		return ErrBufferFull
 	}
 }
 

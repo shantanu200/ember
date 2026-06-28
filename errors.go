@@ -36,6 +36,8 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &pe)
 }
 
+var ErrBufferFull = errors.New("ember: job buffer full")
+
 var DefaultRetryPolicy = RetryPolicy{
 	MaxAttempts: 3,
 	BaseDelay:   200 * time.Millisecond,

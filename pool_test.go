@@ -556,6 +556,27 @@ func TestLoggerDefaultOff(t *testing.T) {
 	// reaching here without panic is the assertion
 }
 
+// --- buffer full ---
+
+func TestSubmitReturnsErrBufferFull(t *testing.T) {
+	// buffer of 1, slow worker so the slot stays occupied
+	pool := NewPool(1, func(_ context.Context, _ any) error {
+		time.Sleep(10 * time.Second)
+		return nil
+	}, WithRetryPolicy(fastPolicy(1)))
+
+	pool.Start(context.Background(), 1)
+
+	// first submit fills the buffer
+	pool.Submit(context.Background(), Task{ID: "t1", Payload: "x"})
+
+	// second submit should get ErrBufferFull immediately
+	err := pool.Submit(context.Background(), Task{ID: "t2", Payload: "x"})
+	if !errors.Is(err, ErrBufferFull) {
+		t.Errorf("expected ErrBufferFull, got %v", err)
+	}
+}
+
 // --- store encoding skip ---
 
 func TestNoStoreSkipsEncoding(t *testing.T) {
