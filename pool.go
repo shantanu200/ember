@@ -277,9 +277,25 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		}
 		return nil
 	case <-ctx.Done():
+		p.rollbackSubmit(t.ID)
 		return ctx.Err()
 	default:
+		p.rollbackSubmit(t.ID)
 		return ErrBufferFull
+	}
+}
+
+// rollbackSubmit removes a task that Submit persisted but could not enqueue. The
+// store write happens before the enqueue so an accepted task is always durable;
+// when the enqueue is rejected the caller is told it was not accepted, so the
+// persisted copy must be cleaned up — otherwise Start would silently re-enqueue
+// an "orphan" the caller believes it never submitted.
+func (p *Pool) rollbackSubmit(id string) {
+	if !p.storeEnabled {
+		return
+	}
+	if err := p.store.DeleteTask(id); err != nil && p.hooks.OnStoreError != nil {
+		p.hooks.OnStoreError(fmt.Errorf("rolling back unenqueued task %s: %w", id, err))
 	}
 }
 
