@@ -30,8 +30,10 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: ${{ matrix.module }}/go.mod
-          check-latest: true
+          # Build/scan on the latest patched release. go.mod declares the
+          # minimum supported version (1.26.2); 'stable' pulls in stdlib
+          # security fixes so govulncheck isn't tripped by toolchain CVEs.
+          go-version: 'stable'
 
       - name: Verify go.mod / go.sum are tidy
         working-directory: ${{ matrix.module }}
@@ -68,8 +70,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
-          check-latest: true
+          go-version: 'stable'
 
       - name: gofmt
         run: |
@@ -100,8 +101,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
-          check-latest: true
+          go-version: 'stable'
 
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
