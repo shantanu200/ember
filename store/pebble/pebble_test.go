@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/shantanu200/ember"
-	pebblestore "github.com/shantanu200/ember/pebble_store"
+	pebblestore "github.com/shantanu200/ember/store/pebble"
 )
 
 func openStore(t *testing.T) *pebblestore.Store {

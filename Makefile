@@ -3,15 +3,18 @@ run:
 
 tidy:
 	go mod tidy
+	go -C store/pebble mod tidy
 
 build:
 	go build -o bootstrap .
 
 vet:
 	go vet ./...
+	go -C store/pebble vet ./...
 
 test:
 	go test -v -race -timeout 30s ./...
+	go -C store/pebble test -v -race -timeout 30s ./...
 
 bench:
 	go test -bench=. -benchmem -count=3 ./...

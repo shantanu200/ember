@@ -25,7 +25,6 @@ type Pool struct {
 	logger       *slog.Logger
 	wg           sync.WaitGroup
 
-	// Dynamic worker scaling (opt-in via WithDynamicWorkers).
 	dynamic        bool
 	minWorkers     int
 	maxWorkers     int
@@ -155,7 +154,8 @@ func (p *Pool) Start(ctx context.Context, workerCount int) error {
 		workerCount = runtime.NumCPU()
 	}
 
-	p.log(slog.LevelInfo, "ember started",
+	p.log(
+		slog.LevelInfo, "ember started",
 		"workers", workerCount,
 		"dynamic", p.dynamic,
 		"min_workers", p.minWorkers,
@@ -317,7 +317,8 @@ func (p *Pool) supervise(ctx context.Context) {
 				p.wg.Add(1)
 				go p.worker(ctx, true)
 			}
-			p.log(slog.LevelDebug, "scaled up workers",
+			p.log(
+				slog.LevelDebug, "scaled up workers",
 				"from", cur, "to", target, "queue_depth", depth,
 			)
 		}
@@ -358,7 +359,8 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 			}
 		}
 
-		p.log(slog.LevelWarn, "task dead-lettered",
+		p.log(
+			slog.LevelWarn, "task dead-lettered",
 			"task_id", task.ID,
 			"attempts", task.Attempt+1,
 			"permanent", dl.Permanent,
@@ -370,7 +372,8 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 		}
 	} else {
 		if p.logger != nil {
-			p.log(slog.LevelDebug, "task succeeded",
+			p.log(
+				slog.LevelDebug, "task succeeded",
 				"task_id", task.ID,
 				"attempts", task.Attempt+1,
 				"elapsed", time.Since(start),
@@ -398,7 +401,8 @@ func (p *Pool) runWithRetry(ctx context.Context, task *Task) error {
 			return err
 		}
 
-		p.log(slog.LevelWarn, "task retrying",
+		p.log(
+			slog.LevelWarn, "task retrying",
 			"task_id", task.ID,
 			"attempt", attempt+1,
 			"max_attempts", p.policy.MaxAttempts,
