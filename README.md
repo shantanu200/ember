@@ -113,6 +113,7 @@ pool := ember.NewPool(256, process,
 | `WithCodec(enc, dec)` | Custom payload encode/decode for the store. Defaults to JSON. |
 | `WithStore(s)` | Durable task persistence (see below). |
 | `WithDynamicWorkers(min, max, threshold)` | Auto-scale workers (see below). |
+| `WithBatching(maxSize, maxWait, fn)` | Process tasks in batches (see below). |
 
 ## Retries and dead-lettering
 
@@ -147,6 +148,62 @@ pool.Start(ctx, 0) // workerCount is ignored in dynamic mode; starts at min
 A supervisor samples the job-buffer fill level; when it crosses `threshold` (a fraction in
 `(0,1]`), the worker count grows multiplicatively up to `max`. Burst workers retire after an
 idle period, returning the pool to `min`. Inspect the live count with `pool.ActiveWorkers()`.
+
+## Batching
+
+For message consumers (Kafka, SQS, Pub/Sub) it's often far cheaper to handle many
+messages per call — one bulk DB write, one batched downstream request, one batch ack —
+than one message at a time. `WithBatching` makes each worker pull up to `maxSize` tasks
+and hand them to a batch processor, while multiple workers still run in parallel:
+
+```go
+pool := ember.NewPool(1024, nil, // single-task ProcessFunc is unused in batch mode
+	ember.WithBatching(100, 50*time.Millisecond,
+		func(ctx context.Context, tasks []ember.Task) []error {
+			errs := make([]error, len(tasks)) // errs[i] belongs to tasks[i]; nil = success
+			rows := make([]Row, len(tasks))
+			for i, t := range tasks {
+				rows[i] = t.Payload.(Row)
+			}
+			if err := bulkInsert(ctx, rows); err != nil {
+				for i := range errs {
+					errs[i] = err // whole batch failed
+				}
+			}
+			return errs
+		},
+	),
+)
+pool.Start(ctx, 8) // 8 workers, each forming its own batch
+
+for _, row := range incoming {
+	pool.Submit(ctx, ember.Task{ID: row.ID, Payload: row})
+}
+```
+
+A worker blocks for the first task, then collects more until the batch hits `maxSize` or
+`maxWait` elapses since the first task — whichever comes first — so a trickle of work is
+never left unflushed. `maxWait <= 0` is best-effort: take whatever is already buffered
+without lingering.
+
+**Per-item outcomes.** The processor returns one error per task, indexed to match the
+input slice (`nil` = that task succeeded). ember settles each task individually:
+
+- successes are acked immediately and fire `OnSuccess`;
+- transient failures are retried **per item** — only the still-failing tasks are
+  re-submitted to the processor on the next attempt, so successful messages are never
+  reprocessed;
+- permanent errors (`NewPermanentError`) and retry-exhausted tasks are dead-lettered
+  individually via `OnDeadLetter`.
+
+Returning a `nil` (or shorter) slice treats the unaddressed tasks as successful. One
+`Result` is still emitted per task on `Results()`, so the rest of the API is unchanged.
+Batching composes with `WithDynamicWorkers` and `WithStore`; producers keep calling
+`Submit` with individual tasks.
+
+A `Store` may optionally implement `BatchStore` (`DeleteTasks`, `SaveDeadLetters`) to
+settle a whole batch in one round-trip; ember falls back to the per-item `Store` methods
+when it doesn't.
 
 ## Durable storage
 

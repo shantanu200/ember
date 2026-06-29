@@ -25,6 +25,11 @@ type Pool struct {
 	logger       *slog.Logger
 	wg           sync.WaitGroup
 
+	batchEnabled bool
+	maxBatchSize int
+	maxBatchWait time.Duration
+	batchProcess BatchProcessFunc
+
 	dynamic        bool
 	minWorkers     int
 	maxWorkers     int
@@ -100,6 +105,38 @@ func WithDynamicWorkers(min, max int, scaleThreshold float64) Option {
 	}
 }
 
+// WithBatching makes each worker pull up to maxSize tasks at once and hand them
+// to fn as a single batch, instead of processing one task per call. This is the
+// natural fit for message consumers (Kafka, SQS, Pub/Sub) where bulk DB writes,
+// batched downstream calls, or batch acks amortise per-message overhead across
+// the whole batch while multiple workers still run in parallel.
+//
+// A worker blocks for the first task, then keeps collecting until the batch
+// reaches maxSize or maxWait elapses since the first task — whichever comes
+// first — so a trickle of work never sits unflushed. maxWait <= 0 means
+// best-effort: take whatever is already buffered without lingering.
+//
+// fn returns one error per task, indexed to match the input slice (nil = that
+// task succeeded). Successful tasks are acked immediately; transient failures
+// are retried per-item on the next attempt (only the still-failing tasks are
+// re-submitted to fn), and permanent or retry-exhausted tasks are dead-lettered
+// individually. Returning a nil or shorter slice treats the unaddressed tasks
+// as successful.
+//
+// maxSize < 1 is clamped to 1. Batching composes with WithDynamicWorkers and
+// WithStore; producers keep calling Submit with individual tasks.
+func WithBatching(maxSize int, maxWait time.Duration, fn BatchProcessFunc) Option {
+	return func(p *Pool) {
+		if maxSize < 1 {
+			maxSize = 1
+		}
+		p.batchEnabled = true
+		p.maxBatchSize = maxSize
+		p.maxBatchWait = maxWait
+		p.batchProcess = fn
+	}
+}
+
 // ActiveWorkers returns the current number of running workers, including any
 // burst workers spawned by the dynamic scaler.
 func (p *Pool) ActiveWorkers() int {
@@ -160,6 +197,9 @@ func (p *Pool) Start(ctx context.Context, workerCount int) error {
 		"dynamic", p.dynamic,
 		"min_workers", p.minWorkers,
 		"max_workers", p.maxWorkers,
+		"batch", p.batchEnabled,
+		"max_batch_size", p.maxBatchSize,
+		"max_batch_wait", p.maxBatchWait,
 		"buffer", cap(p.jobs),
 		"timeout", p.timeout,
 		"max_attempts", p.policy.MaxAttempts,
@@ -246,6 +286,11 @@ func (p *Pool) CloseAndWait() {
 func (p *Pool) worker(ctx context.Context, ephemeral bool) {
 	defer p.wg.Done()
 	defer p.activeWorkers.Add(-1)
+
+	if p.batchEnabled {
+		p.batchWorker(ctx, ephemeral)
+		return
+	}
 
 	if !ephemeral {
 		for {
