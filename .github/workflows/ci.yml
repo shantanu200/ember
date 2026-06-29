@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token; this workflow neither writes to the repo nor publishes anything.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build, vet, and race-test each module independently. They are separate Go
+  # modules (core has zero deps; store/pebble pulls in cockroachdb/pebble), so
+  # each gets its own job via the matrix.
+  test:
+    name: test (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ['.', 'store/pebble']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Build/scan on the latest patched release. go.mod declares the
+          # minimum supported version (1.26.2); 'stable' pulls in stdlib
+          # security fixes so govulncheck isn't tripped by toolchain CVEs.
+          go-version: 'stable'
+
+      - name: Verify go.mod / go.sum are tidy
+        working-directory: ${{ matrix.module }}
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+
+      - name: Build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+
+      - name: Test (race detector, shuffled, coverage)
+        working-directory: ${{ matrix.module }}
+        run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out -timeout 120s ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.module == '.' && 'core' || 'pebble' }}
+          path: ${{ matrix.module }}/coverage.out
+          if-no-files-found: ignore
+
+  # Formatting and static analysis. gofmt is repo-wide; staticcheck runs once per
+  # module because it type-checks against each module's own dependency graph.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: staticcheck
+        run: |
+          for mod in . store/pebble; do
+            echo "::group::staticcheck $mod"
+            (cd "$mod" && staticcheck ./...)
+            echo "::endgroup::"
+          done
+
+  # Scan both modules for known vulnerabilities in their dependency graphs.
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: govulncheck
+        run: |
+          for mod in . store/pebble; do
+            echo "::group::govulncheck $mod"
+            (cd "$mod" && govulncheck ./...)
+            echo "::endgroup::"
+          done
