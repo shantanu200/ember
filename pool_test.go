@@ -598,6 +598,34 @@ func TestSubmitReturnsErrBufferFull(t *testing.T) {
 	}
 }
 
+// --- close without draining results ---
+
+func TestCloseAndWaitWithoutResultDrain(t *testing.T) {
+	// A consumer that never drains Results() must not be able to wedge the pool:
+	// CloseAndWait has to return rather than block forever on workers stuck
+	// emitting results into a full, unread channel.
+	pool := NewPool(2, func(_ context.Context, _ any) error {
+		return nil
+	}, WithRetryPolicy(fastPolicy(1)))
+	pool.Start(context.Background(), 2)
+
+	for i := range 50 {
+		_ = pool.Submit(context.Background(), Task{ID: fmt.Sprintf("t-%d", i), Payload: i})
+	}
+
+	done := make(chan struct{})
+	go func() {
+		pool.CloseAndWait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseAndWait deadlocked with an undrained Results() channel")
+	}
+}
+
 // --- store encoding skip ---
 
 func TestNoStoreSkipsEncoding(t *testing.T) {
