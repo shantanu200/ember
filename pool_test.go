@@ -689,6 +689,26 @@ func TestSubmitRollsBackPersistOnReject(t *testing.T) {
 	pool.CloseAndWait()
 }
 
+func TestSubmitRejectsCancelledContext(t *testing.T) {
+	store := newTrackingStore()
+	pool := NewPool(4, func(_ context.Context, _ any) error { return nil },
+		WithRetryPolicy(fastPolicy(1)), WithStore(store))
+	pool.Start(context.Background(), 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := pool.Submit(ctx, Task{ID: "t1", Payload: "x"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %v", err)
+	}
+	if store.isPending("t1") {
+		t.Errorf("task was persisted despite a cancelled context")
+	}
+
+	pool.CloseAndWait()
+}
+
 // --- store encoding skip ---
 
 func TestNoStoreSkipsEncoding(t *testing.T) {
