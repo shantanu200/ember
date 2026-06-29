@@ -395,12 +395,6 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 	}
 	err := p.runWithRetry(ctx, &task)
 
-	if p.storeEnabled {
-		if delErr := p.store.DeleteTask(task.ID); delErr != nil && p.hooks.OnStoreError != nil {
-			p.hooks.OnStoreError(fmt.Errorf("deleting completed task %s: %w", task.ID, delErr))
-		}
-	}
-
 	if err != nil {
 		dl := DeadLetter{
 			Task:      task,
@@ -444,6 +438,16 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 		}
 		if p.hooks.OnSuccess != nil {
 			p.hooks.OnSuccess(task)
+		}
+	}
+
+	// Remove the task from the pending store only after its outcome has been
+	// durably recorded (dead letter persisted above, or success). Deleting
+	// first would leave a crash window in which the task is neither pending nor
+	// dead-lettered, silently losing it.
+	if p.storeEnabled {
+		if delErr := p.store.DeleteTask(task.ID); delErr != nil && p.hooks.OnStoreError != nil {
+			p.hooks.OnStoreError(fmt.Errorf("deleting completed task %s: %w", task.ID, delErr))
 		}
 	}
 

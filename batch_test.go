@@ -407,6 +407,63 @@ func (s *recordingBatchStore) SaveDeadLetters(dls []RawDeadLetter) error {
 	return nil
 }
 
+// orderingStore records the sequence of settle operations so tests can assert
+// that a dead letter is persisted before the task is removed from pending.
+type orderingStore struct {
+	NoopStore
+	mu  sync.Mutex
+	ops []string
+}
+
+func (s *orderingStore) record(op string) {
+	s.mu.Lock()
+	s.ops = append(s.ops, op)
+	s.mu.Unlock()
+}
+
+func (s *orderingStore) DeleteTask(string) error               { s.record("delete"); return nil }
+func (s *orderingStore) SaveDeadLetter(RawDeadLetter) error    { s.record("save"); return nil }
+func (s *orderingStore) DeleteTasks([]string) error            { s.record("delete"); return nil }
+func (s *orderingStore) SaveDeadLetters([]RawDeadLetter) error { s.record("save"); return nil }
+
+func (s *orderingStore) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ops...)
+}
+
+func TestSingleDeadLetterSavedBeforeDelete(t *testing.T) {
+	store := &orderingStore{}
+	pool := NewPool(1, func(_ context.Context, _ any) error {
+		return NewPermanentError(errors.New("fail"))
+	}, WithRetryPolicy(fastPolicy(1)), WithStore(store))
+
+	pool.Start(context.Background(), 1)
+	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
+
+	if got := store.snapshot(); len(got) != 2 || got[0] != "save" || got[1] != "delete" {
+		t.Errorf("want [save delete], got %v", got)
+	}
+}
+
+func TestBatchDeadLettersSavedBeforeDelete(t *testing.T) {
+	store := &orderingStore{}
+	pool := NewPoolWithBatch(4, 4, 10*time.Millisecond, func(_ context.Context, tasks []Task) []error {
+		errs := make([]error, len(tasks))
+		for i := range errs {
+			errs[i] = NewPermanentError(errors.New("fail"))
+		}
+		return errs
+	}, WithRetryPolicy(fastPolicy(1)), WithStore(store))
+
+	pool.Start(context.Background(), 1)
+	submitAndClose(t, pool, makeTasks(4))
+
+	if got := store.snapshot(); len(got) != 2 || got[0] != "save" || got[1] != "delete" {
+		t.Errorf("want [save delete], got %v", got)
+	}
+}
+
 func TestBatchUsesBatchStore(t *testing.T) {
 	const n = 12
 	store := &recordingBatchStore{}
