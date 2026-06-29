@@ -255,6 +255,12 @@ func (p *Pool) Start(ctx context.Context, workerCount int) error {
 }
 
 func (p *Pool) Submit(ctx context.Context, t Task) error {
+	// Submit is non-blocking, so a cancelled context can only be observed here,
+	// up front — there is no blocking send for a ctx.Done() select case to win.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	if t.EnqueuedAt.IsZero() {
 		t.EnqueuedAt = time.Now()
 	}
@@ -276,9 +282,6 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 			p.log(slog.LevelDebug, "task submitted", "task_id", t.ID)
 		}
 		return nil
-	case <-ctx.Done():
-		p.rollbackSubmit(t.ID)
-		return ctx.Err()
 	default:
 		p.rollbackSubmit(t.ID)
 		return ErrBufferFull
