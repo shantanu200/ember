@@ -166,14 +166,17 @@ func (p *Pool) handleBatch(ctx context.Context, batch []Task) {
 	}
 
 	if p.storeEnabled {
+		// Persist dead letters before removing the batch from the pending
+		// store, so a crash can't drop a failed task that is neither pending
+		// nor dead-lettered.
+		if len(deadLetters) > 0 {
+			p.saveDeadLetters(deadLetters)
+		}
 		ids := make([]string, len(batch))
 		for i := range batch {
 			ids[i] = batch[i].ID
 		}
 		p.deleteTasks(ids)
-		if len(deadLetters) > 0 {
-			p.saveDeadLetters(deadLetters)
-		}
 	}
 
 	if p.logger != nil {
