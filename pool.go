@@ -481,7 +481,15 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 func (p *Pool) runWithRetry(ctx context.Context, task *Task) error {
 	var err error
 
-	for attempt := 0; attempt < p.policy.MaxAttempts; attempt++ {
+	// Resume from the task's current attempt rather than always 0: a task
+	// reloaded from the store after a crash carries the attempt it had reached,
+	// so it continues with its remaining budget instead of a fresh one.
+	start := max(task.Attempt, 0)
+	if start >= p.policy.MaxAttempts {
+		start = p.policy.MaxAttempts - 1
+	}
+
+	for attempt := start; attempt < p.policy.MaxAttempts; attempt++ {
 		task.Attempt = attempt
 		err = p.runOnce(ctx, task.Payload)
 		if err == nil {
@@ -503,6 +511,13 @@ func (p *Pool) runWithRetry(ctx context.Context, task *Task) error {
 			p.hooks.OnRetry(*task, err, attempt)
 		}
 
+		// Durably advance the attempt counter so a crash before the next try
+		// resumes with the remaining budget rather than starting over.
+		if attempt+1 < p.policy.MaxAttempts {
+			task.Attempt = attempt + 1
+			p.persistAttempt(task)
+		}
+
 		delay := p.policy.Delay(attempt)
 		select {
 		case <-ctx.Done():
@@ -512,6 +527,26 @@ func (p *Pool) runWithRetry(ctx context.Context, task *Task) error {
 	}
 
 	return fmt.Errorf("after %d attempts: %w", p.policy.MaxAttempts, err)
+}
+
+// persistAttempt durably records a task's advanced Attempt so that, if the
+// process crashes between retries, the reloaded task resumes with its remaining
+// budget instead of a fresh one. No-op without a store.
+func (p *Pool) persistAttempt(task *Task) {
+	if !p.storeEnabled {
+		return
+	}
+	encoded, err := p.encode(task.Payload)
+	if err != nil {
+		if p.hooks.OnStoreError != nil {
+			p.hooks.OnStoreError(fmt.Errorf("encoding task %s to persist attempt: %w", task.ID, err))
+		}
+		return
+	}
+	raw := RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt}
+	if err := p.store.SaveTask(raw); err != nil && p.hooks.OnStoreError != nil {
+		p.hooks.OnStoreError(fmt.Errorf("persisting attempt for task %s: %w", task.ID, err))
+	}
 }
 
 func (p *Pool) runOnce(parent context.Context, payload any) (err error) {
