@@ -626,6 +626,69 @@ func TestCloseAndWaitWithoutResultDrain(t *testing.T) {
 	}
 }
 
+// trackingStore keeps the live set of persisted-but-not-deleted task ids so a
+// test can assert a rejected Submit leaves nothing orphaned.
+type trackingStore struct {
+	NoopStore
+	mu      sync.Mutex
+	pending map[string]bool
+}
+
+func newTrackingStore() *trackingStore { return &trackingStore{pending: map[string]bool{}} }
+
+func (s *trackingStore) SaveTask(t RawTask) error {
+	s.mu.Lock()
+	s.pending[t.ID] = true
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *trackingStore) DeleteTask(id string) error {
+	s.mu.Lock()
+	delete(s.pending, id)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *trackingStore) isPending(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pending[id]
+}
+
+func TestSubmitRollsBackPersistOnReject(t *testing.T) {
+	store := newTrackingStore()
+	block := make(chan struct{})
+	pool := NewPool(1, func(_ context.Context, _ any) error {
+		<-block
+		return nil
+	}, WithRetryPolicy(fastPolicy(1)), WithStore(store))
+	pool.Start(context.Background(), 1)
+
+	go func() {
+		for range pool.Results() {
+		}
+	}()
+
+	var rejected string
+	for i := range 100 {
+		id := fmt.Sprintf("t-%d", i)
+		if err := pool.Submit(context.Background(), Task{ID: id, Payload: i}); errors.Is(err, ErrBufferFull) {
+			rejected = id
+			break
+		}
+	}
+	if rejected == "" {
+		t.Fatal("expected a Submit to be rejected with ErrBufferFull")
+	}
+	if store.isPending(rejected) {
+		t.Errorf("rejected task %s was left orphaned in the store", rejected)
+	}
+
+	close(block)
+	pool.CloseAndWait()
+}
+
 // --- store encoding skip ---
 
 func TestNoStoreSkipsEncoding(t *testing.T) {
