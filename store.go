@@ -28,7 +28,7 @@ type Store interface {
 
 // BatchStore is an optional interface a Store may implement to settle a whole
 // batch in one round-trip instead of one call per task. When batching is
-// enabled (see WithBatching), the pool type-asserts the configured Store for
+// enabled (see NewPoolWithBatch), the pool type-asserts the configured Store for
 // BatchStore and uses it if present, falling back to the per-item Store methods
 // otherwise. Implementing it is purely a performance optimisation.
 type BatchStore interface {
