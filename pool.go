@@ -39,6 +39,7 @@ type Pool struct {
 	activeWorkers  atomic.Int32
 	quit           chan struct{} // closed by CloseAndWait to stop the supervisor
 	superDone      chan struct{} // closed when the supervisor goroutine exits
+	closing        chan struct{} // closed by CloseAndWait to release workers blocked emitting results
 }
 
 type ProcessFunc func(ctx context.Context, payload any) error
@@ -184,6 +185,7 @@ func newPool(bufferSize int, opts ...Option) *Pool {
 		idleTimeout:   1 * time.Second,
 		quit:          make(chan struct{}),
 		superDone:     make(chan struct{}),
+		closing:       make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -293,8 +295,30 @@ func (p *Pool) CloseAndWait() {
 		<-p.superDone
 	}
 	close(p.jobs)
+	// Release any worker blocked delivering a result to a consumer that has
+	// stopped draining Results(); without this, wg.Wait below would hang
+	// forever. Task outcomes are already committed (hooks + store) before a
+	// result is emitted, so a dropped result loses no authoritative state.
+	close(p.closing)
 	p.wg.Wait()
 	close(p.results)
+}
+
+// emit delivers a result on Results() without blocking forever. It first tries
+// a non-blocking send so a keeping-up consumer always receives every result;
+// only if the buffer is full does it wait, and then a shutdown (p.closing) or a
+// cancelled ctx lets the worker drop the result and exit instead of deadlocking.
+func (p *Pool) emit(ctx context.Context, r Result) {
+	select {
+	case p.results <- r:
+		return
+	default:
+	}
+	select {
+	case p.results <- r:
+	case <-p.closing:
+	case <-ctx.Done():
+	}
 }
 
 // worker runs the job loop. Permanent workers (ephemeral == false) live until
@@ -451,7 +475,7 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 		}
 	}
 
-	p.results <- Result{Task: task, Err: err}
+	p.emit(ctx, Result{Task: task, Err: err})
 }
 
 func (p *Pool) runWithRetry(ctx context.Context, task *Task) error {

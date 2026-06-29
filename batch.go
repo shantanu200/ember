@@ -184,7 +184,7 @@ func (p *Pool) handleBatch(ctx context.Context, batch []Task) {
 	}
 
 	for i := range batch {
-		p.results <- Result{Task: batch[i], Err: errs[i]}
+		p.emit(ctx, Result{Task: batch[i], Err: errs[i]})
 	}
 }
 
