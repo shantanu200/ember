@@ -196,6 +196,27 @@ func TestRetryOnTransientError(t *testing.T) {
 	}
 }
 
+func TestZeroMaxAttemptsStillRunsTask(t *testing.T) {
+	var attempts atomic.Int64
+
+	// A policy with MaxAttempts: 0 must not skip the task and report a phantom
+	// success; the pool clamps it to a single attempt.
+	pool := NewPool(1, func(_ context.Context, _ any) error {
+		attempts.Add(1)
+		return nil
+	}, WithRetryPolicy(RetryPolicy{MaxAttempts: 0, BaseDelay: 0, MaxDelay: 0}))
+
+	pool.Start(context.Background(), 1)
+	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
+
+	if attempts.Load() != 1 {
+		t.Errorf("expected task to run exactly once, got %d attempts", attempts.Load())
+	}
+	if len(results) != 1 || results[0].Err != nil {
+		t.Errorf("expected one successful result, got %+v", results)
+	}
+}
+
 func TestExhaustedRetriesProducesError(t *testing.T) {
 	pool := NewPool(1, func(_ context.Context, _ any) error {
 		return errors.New("always fails")

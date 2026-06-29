@@ -190,6 +190,13 @@ func newPool(bufferSize int, opts ...Option) *Pool {
 		opt(p)
 	}
 
+	// A policy with MaxAttempts < 1 would skip the retry loop entirely and
+	// report every task as succeeded without ever invoking process, silently
+	// dropping work. At least one attempt is always required.
+	if p.policy.MaxAttempts < 1 {
+		p.policy.MaxAttempts = 1
+	}
+
 	return p
 }
 
