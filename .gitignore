@@ -1,3 +1,5 @@
 .*/
+!.github/
 bootstrap
 *.prof
+coverage.out
