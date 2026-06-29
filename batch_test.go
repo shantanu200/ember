@@ -464,6 +464,37 @@ func TestBatchDeadLettersSavedBeforeDelete(t *testing.T) {
 	}
 }
 
+func TestBatchRetryResumesFromLoadedAttempt(t *testing.T) {
+	var calls atomic.Int64
+	pool := NewPoolWithBatch(3, 3, 10*time.Millisecond, func(_ context.Context, tasks []Task) []error {
+		calls.Add(int64(len(tasks)))
+		errs := make([]error, len(tasks))
+		for i := range errs {
+			errs[i] = errors.New("always fails")
+		}
+		return errs
+	}, WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}))
+
+	pool.Start(context.Background(), 1)
+	// Each task is reloaded with Attempt 2, so each has a single try left: three
+	// tasks => three processor calls total, then all are dead-lettered.
+	tasks := []Task{
+		{ID: "a", Payload: 0, Attempt: 2},
+		{ID: "b", Payload: 1, Attempt: 2},
+		{ID: "c", Payload: 2, Attempt: 2},
+	}
+	results := submitAndClose(t, pool, tasks)
+
+	if calls.Load() != 3 {
+		t.Errorf("resumed batch made %d task-calls, want 3 (one each)", calls.Load())
+	}
+	for _, r := range results {
+		if r.Err == nil {
+			t.Errorf("task %s: expected dead-letter error after resumed budget", r.Task.ID)
+		}
+	}
+}
+
 func TestBatchUsesBatchStore(t *testing.T) {
 	const n = 12
 	store := &recordingBatchStore{}

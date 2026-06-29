@@ -230,6 +230,65 @@ func TestExhaustedRetriesProducesError(t *testing.T) {
 	}
 }
 
+// attemptRecordingStore tracks the highest Attempt value ever persisted, so a
+// test can assert the retry loop advances the durable attempt counter.
+type attemptRecordingStore struct {
+	NoopStore
+	mu  sync.Mutex
+	max int
+}
+
+func (s *attemptRecordingStore) SaveTask(t RawTask) error {
+	s.mu.Lock()
+	if t.Attempt > s.max {
+		s.max = t.Attempt
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *attemptRecordingStore) maxAttempt() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.max
+}
+
+func TestRetryPersistsAdvancingAttempt(t *testing.T) {
+	store := &attemptRecordingStore{}
+	pool := NewPool(1, func(_ context.Context, _ any) error {
+		return errors.New("always fails")
+	}, WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}), WithStore(store))
+
+	pool.Start(context.Background(), 1)
+	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
+
+	// Attempts 0,1,2 run; the durable counter is advanced to 2 before the final
+	// try so a crash would resume there rather than at 0.
+	if got := store.maxAttempt(); got != 2 {
+		t.Errorf("max persisted attempt = %d, want 2", got)
+	}
+}
+
+func TestRetryResumesFromLoadedAttempt(t *testing.T) {
+	var calls atomic.Int64
+	pool := NewPool(1, func(_ context.Context, _ any) error {
+		calls.Add(1)
+		return errors.New("always fails")
+	}, WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}))
+
+	pool.Start(context.Background(), 1)
+	// A task reloaded with Attempt 2 (it already used attempts 0 and 1) has a
+	// single try left, not a fresh budget of 3.
+	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x", Attempt: 2}})
+
+	if calls.Load() != 1 {
+		t.Errorf("resumed task ran %d times, want 1 (remaining budget)", calls.Load())
+	}
+	if results[0].Err == nil {
+		t.Error("expected dead-letter error after the resumed budget was exhausted")
+	}
+}
+
 // --- permanent errors ---
 
 func TestPermanentErrorSkipsRetries(t *testing.T) {

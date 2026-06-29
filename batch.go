@@ -197,64 +197,79 @@ func (p *Pool) handleBatch(ctx context.Context, batch []Task) {
 func (p *Pool) runBatchWithRetry(ctx context.Context, batch []Task) []error {
 	finalErr := make([]error, len(batch))
 
-	pending := make([]int, len(batch))
-	for i := range pending {
-		pending[i] = i
+	pending := make([]int, 0, len(batch))
+	for i := range batch {
+		// Resume each task from its own carried attempt (a reload after a crash
+		// brings the attempt it had reached); clamp a value that already meets
+		// the budget so the task still gets one final run before dead-lettering.
+		batch[i].Attempt = max(batch[i].Attempt, 0)
+		if batch[i].Attempt >= p.policy.MaxAttempts {
+			batch[i].Attempt = p.policy.MaxAttempts - 1
+		}
+		pending = append(pending, i)
 	}
 
-	for attempt := 0; attempt < p.policy.MaxAttempts; attempt++ {
+	for len(pending) > 0 {
 		sub := make([]Task, len(pending))
 		for j, idx := range pending {
-			batch[idx].Attempt = attempt
 			sub[j] = batch[idx]
 		}
 
 		errs := p.runBatchOnce(ctx, sub)
 
-		var next []int
+		var (
+			next       []int
+			persist    []Task
+			minAttempt = p.policy.MaxAttempts
+		)
 		for j, idx := range pending {
 			err := errs[j]
 			finalErr[idx] = err
 			if err == nil || IsPermanent(err) {
 				continue
 			}
+			// Out of budget: dead-letter, framed like the single-task path.
+			if batch[idx].Attempt+1 >= p.policy.MaxAttempts {
+				finalErr[idx] = fmt.Errorf("after %d attempts: %w", p.policy.MaxAttempts, err)
+				continue
+			}
 			p.log(
 				slog.LevelWarn, "task retrying",
 				"task_id", batch[idx].ID,
-				"attempt", attempt+1,
+				"attempt", batch[idx].Attempt+1,
 				"max_attempts", p.policy.MaxAttempts,
 				"error", err,
 			)
 			if p.hooks.OnRetry != nil {
-				p.hooks.OnRetry(batch[idx], err, attempt)
+				p.hooks.OnRetry(batch[idx], err, batch[idx].Attempt)
 			}
+			batch[idx].Attempt++
+			minAttempt = min(minAttempt, batch[idx].Attempt)
+			persist = append(persist, batch[idx])
 			next = append(next, idx)
 		}
 
-		pending = next
-		if len(pending) == 0 {
+		if len(next) == 0 {
 			return finalErr
 		}
 
-		if attempt < p.policy.MaxAttempts-1 {
-			select {
-			case <-ctx.Done():
-				for _, idx := range pending {
-					finalErr[idx] = ctx.Err()
-				}
-				return finalErr
-			case <-time.After(p.policy.Delay(attempt)):
-			}
+		// Durably advance attempts so a crash mid-retry resumes each task with
+		// its remaining budget rather than a fresh one.
+		for i := range persist {
+			p.persistAttempt(&persist[i])
 		}
+
+		select {
+		case <-ctx.Done():
+			for _, idx := range next {
+				finalErr[idx] = ctx.Err()
+			}
+			return finalErr
+		case <-time.After(p.policy.Delay(minAttempt - 1)):
+		}
+		pending = next
 	}
 
-	// Surviving transient failures exhausted their attempts; wrap them to match
-	// the single-task path's "after N attempts" framing.
-	for _, idx := range pending {
-		if finalErr[idx] != nil {
-			finalErr[idx] = fmt.Errorf("after %d attempts: %w", p.policy.MaxAttempts, finalErr[idx])
-		}
-	}
 	return finalErr
 }
 
