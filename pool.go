@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,17 @@ type Pool struct {
 	decode       func([]byte) (any, error)
 	logger       *slog.Logger
 	wg           sync.WaitGroup
+
+	// Dynamic worker scaling (opt-in via WithDynamicWorkers).
+	dynamic        bool
+	minWorkers     int
+	maxWorkers     int
+	scaleThreshold float64       // jobs-buffer fill fraction that triggers scale-up
+	scaleInterval  time.Duration // how often the supervisor samples queue depth
+	idleTimeout    time.Duration // a burst worker retires after this long without a task
+	activeWorkers  atomic.Int32
+	quit           chan struct{} // closed by CloseAndWait to stop the supervisor
+	superDone      chan struct{} // closed when the supervisor goroutine exits
 }
 
 type ProcessFunc func(ctx context.Context, payload any) error
@@ -61,6 +73,40 @@ func WithLogger(l *slog.Logger) Option {
 	return func(p *Pool) { p.logger = l }
 }
 
+// WithDynamicWorkers enables auto-scaling of the worker pool.
+//
+// The pool starts with min workers. A supervisor samples the jobs-buffer fill
+// level; when it reaches scaleThreshold (a fraction in (0,1]) the worker count
+// is grown — multiplicatively — up to max. Burst workers retire after an idle
+// period, returning the pool to min. This absorbs load spikes without forcing
+// the caller to permanently over-provision workers.
+//
+// min < 1 is clamped to 1; max < min is clamped to min; a scaleThreshold
+// outside (0,1] defaults to 0.5.
+func WithDynamicWorkers(min, max int, scaleThreshold float64) Option {
+	return func(p *Pool) {
+		if min < 1 {
+			min = 1
+		}
+		if max < min {
+			max = min
+		}
+		if scaleThreshold <= 0 || scaleThreshold > 1 {
+			scaleThreshold = 0.5
+		}
+		p.dynamic = true
+		p.minWorkers = min
+		p.maxWorkers = max
+		p.scaleThreshold = scaleThreshold
+	}
+}
+
+// ActiveWorkers returns the current number of running workers, including any
+// burst workers spawned by the dynamic scaler.
+func (p *Pool) ActiveWorkers() int {
+	return int(p.activeWorkers.Load())
+}
+
 func (p *Pool) log(level slog.Level, msg string, args ...any) {
 	if p.logger == nil {
 		return
@@ -86,7 +132,11 @@ func NewPool(bufferSize int, process ProcessFunc, opts ...Option) *Pool {
 			var v any
 			return v, json.Unmarshal(b, &v)
 		},
-		logger: nil,
+		logger:        nil,
+		scaleInterval: 100 * time.Millisecond,
+		idleTimeout:   1 * time.Second,
+		quit:          make(chan struct{}),
+		superDone:     make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -97,12 +147,19 @@ func NewPool(bufferSize int, process ProcessFunc, opts ...Option) *Pool {
 }
 
 func (p *Pool) Start(ctx context.Context, workerCount int) error {
-	if workerCount == 0 {
+	if p.dynamic {
+		// In dynamic mode the worker count is governed by min/max; the
+		// workerCount argument is ignored in favour of the configured floor.
+		workerCount = p.minWorkers
+	} else if workerCount == 0 {
 		workerCount = runtime.NumCPU()
 	}
 
 	p.log(slog.LevelInfo, "ember started",
 		"workers", workerCount,
+		"dynamic", p.dynamic,
+		"min_workers", p.minWorkers,
+		"max_workers", p.maxWorkers,
 		"buffer", cap(p.jobs),
 		"timeout", p.timeout,
 		"max_attempts", p.policy.MaxAttempts,
@@ -111,8 +168,13 @@ func (p *Pool) Start(ctx context.Context, workerCount int) error {
 	)
 
 	for i := 0; i < workerCount; i++ {
+		p.activeWorkers.Add(1)
 		p.wg.Add(1)
-		go p.worker(ctx)
+		go p.worker(ctx, false)
+	}
+
+	if p.dynamic {
+		go p.supervise(ctx)
 	}
 
 	if p.storeEnabled {
@@ -166,13 +228,41 @@ func (p *Pool) Results() <-chan Result {
 }
 
 func (p *Pool) CloseAndWait() {
+	if p.dynamic {
+		// Stop the supervisor before closing jobs so it can't call wg.Add
+		// concurrently with the wg.Wait below.
+		close(p.quit)
+		<-p.superDone
+	}
 	close(p.jobs)
 	p.wg.Wait()
 	close(p.results)
 }
 
-func (p *Pool) worker(ctx context.Context) {
+// worker runs the job loop. Permanent workers (ephemeral == false) live until
+// ctx is cancelled or the jobs channel is closed. Ephemeral burst workers,
+// spawned by the dynamic scaler, additionally retire after idleTimeout with no
+// work so the pool can shrink back to its floor.
+func (p *Pool) worker(ctx context.Context, ephemeral bool) {
 	defer p.wg.Done()
+	defer p.activeWorkers.Add(-1)
+
+	if !ephemeral {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case task, ok := <-p.jobs:
+				if !ok {
+					return
+				}
+				p.handle(ctx, task)
+			}
+		}
+	}
+
+	idle := time.NewTimer(p.idleTimeout)
+	defer idle.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -182,6 +272,54 @@ func (p *Pool) worker(ctx context.Context) {
 				return
 			}
 			p.handle(ctx, task)
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(p.idleTimeout)
+		case <-idle.C:
+			return
+		}
+	}
+}
+
+// supervise samples the jobs-buffer depth and grows the worker pool toward
+// maxWorkers when it crosses scaleThreshold. Growth is multiplicative for fast
+// reaction to spikes; shrink-back is handled by idle burst workers retiring.
+func (p *Pool) supervise(ctx context.Context) {
+	defer close(p.superDone)
+
+	ticker := time.NewTicker(p.scaleInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.quit:
+			return
+		case <-ticker.C:
+			capJobs := cap(p.jobs)
+			if capJobs == 0 {
+				continue
+			}
+			depth := float64(len(p.jobs)) / float64(capJobs)
+			cur := int(p.activeWorkers.Load())
+			if depth < p.scaleThreshold || cur >= p.maxWorkers {
+				continue
+			}
+
+			target := min(cur*2, p.maxWorkers)
+			for i := cur; i < target; i++ {
+				p.activeWorkers.Add(1)
+				p.wg.Add(1)
+				go p.worker(ctx, true)
+			}
+			p.log(slog.LevelDebug, "scaled up workers",
+				"from", cur, "to", target, "queue_depth", depth,
+			)
 		}
 	}
 }

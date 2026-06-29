@@ -640,3 +640,148 @@ func TestEnqueuedAtAutoSet(t *testing.T) {
 		t.Errorf("EnqueuedAt %v not between %v and %v", ts, before, after)
 	}
 }
+
+// --- dynamic worker scaling ---
+
+// waitFor polls cond until it returns true or the timeout elapses.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return cond()
+}
+
+func TestDynamicWorkersScaleUpAndDown(t *testing.T) {
+	pool := NewPool(64, func(_ context.Context, _ any) error {
+		time.Sleep(15 * time.Millisecond)
+		return nil
+	},
+		WithRetryPolicy(fastPolicy(1)),
+		WithDynamicWorkers(2, 16, 0.25),
+	)
+	// Tighten timings so the test doesn't depend on the production defaults.
+	pool.scaleInterval = 5 * time.Millisecond
+	pool.idleTimeout = 60 * time.Millisecond
+
+	pool.Start(context.Background(), 0)
+	go func() {
+		for range pool.Results() {
+		}
+	}()
+
+	if got := pool.ActiveWorkers(); got != 2 {
+		t.Fatalf("initial workers = %d, want 2 (min)", got)
+	}
+
+	// Flood to build a backlog; ErrBufferFull on a full buffer is fine here.
+	floodDone := make(chan struct{})
+	go func() {
+		defer close(floodDone)
+		for i := range 600 {
+			pool.Submit(context.Background(), Task{ID: fmt.Sprintf("t-%d", i), Payload: i})
+		}
+	}()
+
+	if !waitFor(t, 2*time.Second, func() bool { return pool.ActiveWorkers() > 2 }) {
+		t.Fatalf("workers never scaled up beyond min; got %d", pool.ActiveWorkers())
+	}
+	if got := pool.ActiveWorkers(); got > 16 {
+		t.Fatalf("workers exceeded max: %d", got)
+	}
+
+	// Stop producing before closing: CloseAndWait closes the jobs channel and
+	// must not race a concurrent Submit.
+	<-floodDone
+
+	// Once the backlog drains and burst workers idle out, return to min.
+	if !waitFor(t, 3*time.Second, func() bool { return pool.ActiveWorkers() == 2 }) {
+		t.Fatalf("workers never scaled back to min; got %d", pool.ActiveWorkers())
+	}
+
+	pool.CloseAndWait()
+}
+
+func TestDynamicWorkersRespectMax(t *testing.T) {
+	const max = 8
+	pool := NewPool(32, func(_ context.Context, _ any) error {
+		time.Sleep(20 * time.Millisecond)
+		return nil
+	},
+		WithRetryPolicy(fastPolicy(1)),
+		WithDynamicWorkers(2, max, 0.1),
+	)
+	pool.scaleInterval = 3 * time.Millisecond
+	pool.idleTimeout = 50 * time.Millisecond
+
+	pool.Start(context.Background(), 0)
+	go func() {
+		for range pool.Results() {
+		}
+	}()
+
+	stop := make(chan struct{})
+	prodDone := make(chan struct{})
+	go func() {
+		defer close(prodDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				pool.Submit(context.Background(), Task{ID: "x", Payload: 1})
+			}
+		}
+	}()
+
+	peak := 0
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if a := pool.ActiveWorkers(); a > peak {
+			peak = a
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	close(stop)
+	<-prodDone // ensure no Submit races the CloseAndWait below
+
+	if peak > max {
+		t.Fatalf("workers exceeded max %d: peaked at %d", max, peak)
+	}
+	if peak <= 2 {
+		t.Fatalf("workers never scaled up under sustained load; peaked at %d", peak)
+	}
+
+	pool.CloseAndWait()
+}
+
+func TestDynamicWorkersCleanShutdown(t *testing.T) {
+	const n = 50
+	pool := NewPool(n, func(_ context.Context, _ any) error { return nil },
+		WithRetryPolicy(fastPolicy(1)),
+		WithDynamicWorkers(2, 8, 0.5),
+	)
+	pool.scaleInterval = 5 * time.Millisecond
+
+	pool.Start(context.Background(), 0)
+
+	done := make(chan struct{})
+	go func() {
+		submitAndClose(t, pool, makeTasks(n))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseAndWait did not return — supervisor or worker leak")
+	}
+
+	if a := pool.ActiveWorkers(); a != 0 {
+		t.Errorf("active workers after shutdown = %d, want 0", a)
+	}
+}
