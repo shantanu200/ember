@@ -12,7 +12,7 @@ import (
 // tasks[i]); a nil entry means that task succeeded. Returning a nil slice — or
 // one shorter than the batch — treats the unaddressed tasks as successful.
 //
-// Enable batching with WithBatching.
+// Enable batching by constructing the pool with NewPoolWithBatch.
 type BatchProcessFunc func(ctx context.Context, tasks []Task) []error
 
 // batchWorker is the batch-mode counterpart of worker. It repeatedly gathers a

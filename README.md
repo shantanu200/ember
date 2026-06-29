@@ -113,7 +113,6 @@ pool := ember.NewPool(256, process,
 | `WithCodec(enc, dec)` | Custom payload encode/decode for the store. Defaults to JSON. |
 | `WithStore(s)` | Durable task persistence (see below). |
 | `WithDynamicWorkers(min, max, threshold)` | Auto-scale workers (see below). |
-| `WithBatching(maxSize, maxWait, fn)` | Process tasks in batches (see below). |
 
 ## Retries and dead-lettering
 
@@ -153,26 +152,24 @@ idle period, returning the pool to `min`. Inspect the live count with `pool.Acti
 
 For message consumers (Kafka, SQS, Pub/Sub) it's often far cheaper to handle many
 messages per call — one bulk DB write, one batched downstream request, one batch ack —
-than one message at a time. `WithBatching` makes each worker pull up to `maxSize` tasks
-and hand them to a batch processor, while multiple workers still run in parallel:
+than one message at a time. `NewPoolWithBatch` makes each worker pull up to `maxSize`
+tasks and hand them to a batch processor, while multiple workers still run in parallel:
 
 ```go
-pool := ember.NewPool(1024, nil, // single-task ProcessFunc is unused in batch mode
-	ember.WithBatching(100, 50*time.Millisecond,
-		func(ctx context.Context, tasks []ember.Task) []error {
-			errs := make([]error, len(tasks)) // errs[i] belongs to tasks[i]; nil = success
-			rows := make([]Row, len(tasks))
-			for i, t := range tasks {
-				rows[i] = t.Payload.(Row)
+pool := ember.NewPoolWithBatch(1024, 100, 50*time.Millisecond,
+	func(ctx context.Context, tasks []ember.Task) []error {
+		errs := make([]error, len(tasks)) // errs[i] belongs to tasks[i]; nil = success
+		rows := make([]Row, len(tasks))
+		for i, t := range tasks {
+			rows[i] = t.Payload.(Row)
+		}
+		if err := bulkInsert(ctx, rows); err != nil {
+			for i := range errs {
+				errs[i] = err // whole batch failed
 			}
-			if err := bulkInsert(ctx, rows); err != nil {
-				for i := range errs {
-					errs[i] = err // whole batch failed
-				}
-			}
-			return errs
-		},
-	),
+		}
+		return errs
+	},
 )
 pool.Start(ctx, 8) // 8 workers, each forming its own batch
 

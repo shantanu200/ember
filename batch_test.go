@@ -20,17 +20,16 @@ func TestBatchAllTasksProcessed(t *testing.T) {
 		batchSeen []int
 	)
 
-	pool := NewPool(n, nil,
+	pool := NewPoolWithBatch(n, 8, 20*time.Millisecond, func(_ context.Context, tasks []Task) []error {
+		mu.Lock()
+		batchSeen = append(batchSeen, len(tasks))
+		for _, task := range tasks {
+			seen[task.ID] = true
+		}
+		mu.Unlock()
+		return make([]error, len(tasks))
+	},
 		WithRetryPolicy(fastPolicy(1)),
-		WithBatching(8, 20*time.Millisecond, func(_ context.Context, tasks []Task) []error {
-			mu.Lock()
-			batchSeen = append(batchSeen, len(tasks))
-			for _, task := range tasks {
-				seen[task.ID] = true
-			}
-			mu.Unlock()
-			return make([]error, len(tasks))
-		}),
 	)
 
 	if err := pool.Start(context.Background(), 4); err != nil {
@@ -64,17 +63,16 @@ func TestBatchRespectsMaxSize(t *testing.T) {
 	const n = 30
 	var maxObserved atomic.Int64
 
-	pool := NewPool(n, nil,
-		WithRetryPolicy(fastPolicy(1)),
-		WithBatching(5, 50*time.Millisecond, func(_ context.Context, tasks []Task) []error {
-			for {
-				cur := maxObserved.Load()
-				if int64(len(tasks)) <= cur || maxObserved.CompareAndSwap(cur, int64(len(tasks))) {
-					break
-				}
+	pool := NewPoolWithBatch(n, 5, 50*time.Millisecond, func(_ context.Context, tasks []Task) []error {
+		for {
+			cur := maxObserved.Load()
+			if int64(len(tasks)) <= cur || maxObserved.CompareAndSwap(cur, int64(len(tasks))) {
+				break
 			}
-			return make([]error, len(tasks))
-		}),
+		}
+		return make([]error, len(tasks))
+	},
+		WithRetryPolicy(fastPolicy(1)),
 	)
 	// Single worker so the buffer is full when the worker grabs its batch.
 	pool.Start(context.Background(), 1)
@@ -107,12 +105,11 @@ func TestBatchRespectsMaxSize(t *testing.T) {
 func TestBatchFlushesOnMaxWait(t *testing.T) {
 	got := make(chan int, 4)
 
-	pool := NewPool(16, nil,
+	pool := NewPoolWithBatch(16, 100, 30*time.Millisecond, func(_ context.Context, tasks []Task) []error {
+		got <- len(tasks)
+		return make([]error, len(tasks))
+	},
 		WithRetryPolicy(fastPolicy(1)),
-		WithBatching(100, 30*time.Millisecond, func(_ context.Context, tasks []Task) []error {
-			got <- len(tasks)
-			return make([]error, len(tasks))
-		}),
 	)
 	pool.Start(context.Background(), 1)
 	go func() {
@@ -149,17 +146,16 @@ func TestBatchPartialFailureDeadLettersOnlyFailures(t *testing.T) {
 	)
 
 	// Odd payloads always fail; evens succeed.
-	pool := NewPool(n, nil,
-		WithRetryPolicy(fastPolicy(1)),
-		WithBatching(n, 10*time.Millisecond, func(_ context.Context, tasks []Task) []error {
-			errs := make([]error, len(tasks))
-			for i, task := range tasks {
-				if task.Payload.(int)%2 != 0 {
-					errs[i] = errors.New("odd fails")
-				}
+	pool := NewPoolWithBatch(n, n, 10*time.Millisecond, func(_ context.Context, tasks []Task) []error {
+		errs := make([]error, len(tasks))
+		for i, task := range tasks {
+			if task.Payload.(int)%2 != 0 {
+				errs[i] = errors.New("odd fails")
 			}
-			return errs
-		}),
+		}
+		return errs
+	},
+		WithRetryPolicy(fastPolicy(1)),
 		WithHooks(Hooks{
 			OnDeadLetter: func(dl DeadLetter) {
 				mu.Lock()
@@ -215,9 +211,8 @@ func TestBatchRetriesOnlyFailingItems(t *testing.T) {
 		return errs
 	}
 
-	pool := NewPool(5, nil,
+	pool := NewPoolWithBatch(5, 5, 10*time.Millisecond, process,
 		WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}),
-		WithBatching(5, 10*time.Millisecond, process),
 	)
 	pool.Start(context.Background(), 1)
 
@@ -256,16 +251,15 @@ func TestBatchRetriesOnlyFailingItems(t *testing.T) {
 func TestBatchPermanentErrorSkipsRetries(t *testing.T) {
 	var calls atomic.Int64
 
-	pool := NewPool(3, nil,
+	pool := NewPoolWithBatch(3, 3, 10*time.Millisecond, func(_ context.Context, tasks []Task) []error {
+		calls.Add(1)
+		errs := make([]error, len(tasks))
+		for i := range tasks {
+			errs[i] = NewPermanentError(errors.New("fatal"))
+		}
+		return errs
+	},
 		WithRetryPolicy(RetryPolicy{MaxAttempts: 5, BaseDelay: 0, MaxDelay: 0}),
-		WithBatching(3, 10*time.Millisecond, func(_ context.Context, tasks []Task) []error {
-			calls.Add(1)
-			errs := make([]error, len(tasks))
-			for i := range tasks {
-				errs[i] = NewPermanentError(errors.New("fatal"))
-			}
-			return errs
-		}),
 	)
 	pool.Start(context.Background(), 1)
 
@@ -282,15 +276,14 @@ func TestBatchPermanentErrorSkipsRetries(t *testing.T) {
 }
 
 func TestBatchExhaustedRetriesDeadLetters(t *testing.T) {
-	pool := NewPool(3, nil,
+	pool := NewPoolWithBatch(3, 3, 10*time.Millisecond, func(_ context.Context, tasks []Task) []error {
+		errs := make([]error, len(tasks))
+		for i := range tasks {
+			errs[i] = errors.New("always fails")
+		}
+		return errs
+	},
 		WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}),
-		WithBatching(3, 10*time.Millisecond, func(_ context.Context, tasks []Task) []error {
-			errs := make([]error, len(tasks))
-			for i := range tasks {
-				errs[i] = errors.New("always fails")
-			}
-			return errs
-		}),
 	)
 	pool.Start(context.Background(), 1)
 
@@ -306,11 +299,10 @@ func TestBatchExhaustedRetriesDeadLetters(t *testing.T) {
 // --- panic recovery ---
 
 func TestBatchPanicRecovered(t *testing.T) {
-	pool := NewPool(3, nil,
+	pool := NewPoolWithBatch(3, 3, 10*time.Millisecond, func(_ context.Context, _ []Task) []error {
+		panic("boom")
+	},
 		WithRetryPolicy(fastPolicy(1)),
-		WithBatching(3, 10*time.Millisecond, func(_ context.Context, _ []Task) []error {
-			panic("boom")
-		}),
 	)
 	pool.Start(context.Background(), 1)
 
@@ -328,11 +320,10 @@ func TestBatchPanicRecovered(t *testing.T) {
 // --- nil/short return treated as success ---
 
 func TestBatchNilReturnAllSucceed(t *testing.T) {
-	pool := NewPool(5, nil,
+	pool := NewPoolWithBatch(5, 5, 10*time.Millisecond, func(_ context.Context, _ []Task) []error {
+		return nil // nil = every task succeeded
+	},
 		WithRetryPolicy(fastPolicy(1)),
-		WithBatching(5, 10*time.Millisecond, func(_ context.Context, _ []Task) []error {
-			return nil // nil = every task succeeded
-		}),
 	)
 	pool.Start(context.Background(), 1)
 
@@ -350,12 +341,11 @@ func TestBatchCleanDrainOnClose(t *testing.T) {
 	const n = 100
 	var processed atomic.Int64
 
-	pool := NewPool(n, nil,
+	pool := NewPoolWithBatch(n, 16, 5*time.Millisecond, func(_ context.Context, tasks []Task) []error {
+		processed.Add(int64(len(tasks)))
+		return make([]error, len(tasks))
+	},
 		WithRetryPolicy(fastPolicy(1)),
-		WithBatching(16, 5*time.Millisecond, func(_ context.Context, tasks []Task) []error {
-			processed.Add(int64(len(tasks)))
-			return make([]error, len(tasks))
-		}),
 	)
 	pool.Start(context.Background(), 4)
 
@@ -375,12 +365,11 @@ func TestBatchBestEffortNoLinger(t *testing.T) {
 	const n = 20
 	var processed atomic.Int64
 
-	pool := NewPool(n, nil,
+	pool := NewPoolWithBatch(n, 8, 0, func(_ context.Context, tasks []Task) []error {
+		processed.Add(int64(len(tasks)))
+		return make([]error, len(tasks))
+	},
 		WithRetryPolicy(fastPolicy(1)),
-		WithBatching(8, 0, func(_ context.Context, tasks []Task) []error {
-			processed.Add(int64(len(tasks)))
-			return make([]error, len(tasks))
-		}),
 	)
 	pool.Start(context.Background(), 2)
 
@@ -422,18 +411,17 @@ func TestBatchUsesBatchStore(t *testing.T) {
 	const n = 12
 	store := &recordingBatchStore{}
 
-	pool := NewPool(n, nil,
+	pool := NewPoolWithBatch(n, n, 10*time.Millisecond, func(_ context.Context, tasks []Task) []error {
+		errs := make([]error, len(tasks))
+		for i, task := range tasks {
+			if task.Payload.(int) < 3 {
+				errs[i] = NewPermanentError(errors.New("fail"))
+			}
+		}
+		return errs
+	},
 		WithRetryPolicy(fastPolicy(1)),
 		WithStore(store),
-		WithBatching(n, 10*time.Millisecond, func(_ context.Context, tasks []Task) []error {
-			errs := make([]error, len(tasks))
-			for i, task := range tasks {
-				if task.Payload.(int) < 3 {
-					errs[i] = NewPermanentError(errors.New("fail"))
-				}
-			}
-			return errs
-		}),
 	)
 	// One worker + a buffer pre-fill so the whole set lands in one batch.
 	pool.Start(context.Background(), 1)
