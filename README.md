@@ -116,7 +116,9 @@ pool := quelon.NewPool(process,
 | `WithHooks(h)` | Success / retry / dead-letter / store-error callbacks. |
 | `WithLogger(l)` | Attach an `*slog.Logger`. Logs nothing by default. |
 | `WithCodec(enc, dec)` | Custom payload encode/decode for the store. Defaults to JSON. |
-| `WithStore(s)` | Durable task persistence (see below). |
+| `WithStore(s)` | Durable task persistence in `PersistAll` mode (see below). |
+| `WithStoreMode(s, mode)` | Durable persistence with an explicit `PersistMode` (see below). |
+| `WithGroupCommit(size, every)` | Tune the store writer: flush every `size` ops or `every` interval. Default: 256 / 5ms. |
 | `WithDynamicWorkers(min, max, threshold)` | Auto-scale workers (see below). |
 | `WithMaxBatchSize(n)` | Max tasks per batch (`NewPoolWithBatch` only). Default: 10. |
 | `WithMaxBatchWait(d)` | Max wait to fill a batch. 0 = best-effort (`NewPoolWithBatch` only). |
@@ -238,6 +240,33 @@ pool := quelon.NewPool(process, quelon.WithBufferSize(256), quelon.WithStore(sto
 Implement the `quelon.Store` interface to back the pool with any other engine (Redis, SQL,
 etc.); keeping the interface in the core is what lets heavy implementations live in their own
 submodule without bloating the core's dependency graph.
+
+### Persistence modes — who owns durability
+
+Ingestion never blocks on a per-task disk sync. All store mutations flow through a single
+**group-commit writer** that batches them into one durable commit per flush window (tune with
+`WithGroupCommit`) — the same trade-off a broker's producer batching (`linger.ms` / `acks`)
+makes. `WithStoreMode` picks what the store is for:
+
+| Mode | Store is… | Ingestion | Crash recovery of pending work |
+|------|-----------|-----------|--------------------------------|
+| `PersistNone` (default) | unused | never touches store | none |
+| `PersistDeadLettersOnly` | a dead-letter archive | never touches store | none — the upstream source (Kafka/SQS/…) owns durability |
+| `PersistAll` (`WithStore`) | write-ahead log + dead-letter archive | persisted via the writer | pending tasks reload on `Start` |
+
+```go
+// Broker-backed consumer: re-consume on restart, only archive poison messages.
+pool := quelon.NewPoolWithBatch(process, quelon.WithStoreMode(store, quelon.PersistDeadLettersOnly))
+
+// Front-door queue: Submit is the only durable record of accepted work.
+pool := quelon.NewPool(process, quelon.WithStore(store)) // == PersistAll
+```
+
+Because persistence is asynchronous, `PersistAll` is **group-committed durability, not
+persist-before-ack**: a crash can lose work accepted within the current flush window (bounded
+by `WithGroupCommit`). A `Store` may implement the optional `CommitStore` interface
+(`Commit(saves, deletes, deadLetters)`) to apply a whole window atomically with one fsync — the
+Pebble store does. Stores without it fall back to per-item `Store`/`BatchStore` calls.
 
 ## License
 

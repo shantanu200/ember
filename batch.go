@@ -119,7 +119,6 @@ func (p *Pool) handleBatch(ctx context.Context, batch []Task) {
 
 	errs := p.runBatchWithRetry(ctx, batch)
 
-	var deadLetters []RawDeadLetter
 	for i := range batch {
 		task := batch[i]
 		err := errs[i]
@@ -144,13 +143,19 @@ func (p *Pool) handleBatch(ctx context.Context, batch []Task) {
 			Permanent: IsPermanent(err),
 			FailedAt:  time.Now(),
 		}
-		if p.storeEnabled {
+		// Queue the dead letter before this batch's delete ops (below): the
+		// writer applies dead letters before deletes within a window, so a
+		// failed task is durable as a dead letter before it leaves pending.
+		if p.persistDeadLetters {
 			encoded, _ := p.encode(task.Payload)
-			deadLetters = append(deadLetters, RawDeadLetter{
-				Task:      RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
-				Err:       dl.Err,
-				Permanent: dl.Permanent,
-				FailedAt:  dl.FailedAt,
+			p.queueOp(storeOp{
+				kind: opDeadLetter,
+				dl: RawDeadLetter{
+					Task:      RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+					Err:       dl.Err,
+					Permanent: dl.Permanent,
+					FailedAt:  dl.FailedAt,
+				},
 			})
 		}
 		p.log(
@@ -165,18 +170,10 @@ func (p *Pool) handleBatch(ctx context.Context, batch []Task) {
 		}
 	}
 
-	if p.storeEnabled {
-		// Persist dead letters before removing the batch from the pending
-		// store, so a crash can't drop a failed task that is neither pending
-		// nor dead-lettered.
-		if len(deadLetters) > 0 {
-			p.saveDeadLetters(deadLetters)
-		}
-		ids := make([]string, len(batch))
+	if p.persistPending {
 		for i := range batch {
-			ids[i] = batch[i].ID
+			p.queueOp(storeOp{kind: opDelete, id: batch[i].ID})
 		}
-		p.deleteTasks(ids)
 	}
 
 	if p.logger != nil {
