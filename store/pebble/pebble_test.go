@@ -1,12 +1,19 @@
 package pebblestore_test
 
 import (
+	"context"
+	"errors"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/shantanu200/quelon"
 	pebblestore "github.com/shantanu200/quelon/store/pebble"
 )
+
+var errStub = errors.New("stub failure")
+
+func id(i int) string { return "t-" + strconv.Itoa(i) }
 
 func openStore(t *testing.T) *pebblestore.Store {
 	t.Helper()
@@ -222,6 +229,128 @@ func TestPendingAndDeadKeysDontCollide(t *testing.T) {
 	}
 }
 
-// --- Store satisfies the quelon.Store interface at compile time ---
+// --- Commit (group commit) ---
 
-var _ quelon.Store = (*pebblestore.Store)(nil)
+func TestCommitAppliesSavesDeadLettersAndDeletes(t *testing.T) {
+	s := openStore(t)
+
+	// First window: persist three pending tasks in one atomic commit.
+	if err := s.Commit([]quelon.RawTask{rawTask("a"), rawTask("b"), rawTask("c")}, nil, nil); err != nil {
+		t.Fatalf("Commit (saves): %v", err)
+	}
+	if got, _ := s.LoadPendingTasks(); len(got) != 3 {
+		t.Fatalf("after save commit: %d pending, want 3", len(got))
+	}
+
+	// Second window: "a" succeeds (delete), "b" fails (dead letter + delete),
+	// "c" stays pending. One atomic commit settles all of it.
+	dl := quelon.RawDeadLetter{Task: rawTask("b"), Err: "boom", FailedAt: time.Now()}
+	if err := s.Commit(nil, []string{"a", "b"}, []quelon.RawDeadLetter{dl}); err != nil {
+		t.Fatalf("Commit (settle): %v", err)
+	}
+
+	pending, err := s.LoadPendingTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].ID != "c" {
+		t.Errorf("pending after settle = %v, want [c]", pending)
+	}
+	dead, err := s.LoadDeadLetters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dead) != 1 || dead[0].Task.ID != "b" {
+		t.Errorf("dead letters after settle = %v, want [b]", dead)
+	}
+}
+
+func TestCommitEmptyIsNoOp(t *testing.T) {
+	s := openStore(t)
+	if err := s.Commit(nil, nil, nil); err != nil {
+		t.Errorf("empty Commit: %v", err)
+	}
+}
+
+// --- end-to-end through the pool's group-commit writer ---
+
+// After a burst of successful tasks settles, the store must hold no pending
+// records — the completion deletes are never lost or reordered behind the saves.
+func TestPoolGroupCommitLeavesNoPendingOnSuccess(t *testing.T) {
+	s := openStore(t)
+
+	pool := quelon.NewPool(func(context.Context, any) error { return nil },
+		quelon.WithBufferSize(256),
+		quelon.WithWorkerCount(4),
+		quelon.WithRetryPolicy(quelon.RetryPolicy{MaxAttempts: 1}),
+		quelon.WithStore(s),
+	)
+	if err := pool.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	go func() {
+		for range pool.Results() {
+		}
+	}()
+	for i := 0; i < 500; i++ {
+		if err := pool.Submit(context.Background(), quelon.Task{ID: id(i), Payload: i}); err != nil {
+			t.Fatalf("Submit %d: %v", i, err)
+		}
+	}
+	pool.CloseAndWait()
+
+	pending, err := s.LoadPendingTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("after all tasks succeeded, %d pending records remain (want 0)", len(pending))
+	}
+}
+
+// A permanently failing task must end up durable as a dead letter and gone from
+// pending — the dead-letter write committing before the pending delete.
+func TestPoolGroupCommitPersistsDeadLetter(t *testing.T) {
+	s := openStore(t)
+
+	pool := quelon.NewPool(func(context.Context, any) error {
+		return quelon.NewPermanentError(errStub)
+	},
+		quelon.WithWorkerCount(1),
+		quelon.WithRetryPolicy(quelon.RetryPolicy{MaxAttempts: 1}),
+		quelon.WithStore(s),
+	)
+	if err := pool.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	go func() {
+		for range pool.Results() {
+		}
+	}()
+	if err := pool.Submit(context.Background(), quelon.Task{ID: "poison", Payload: 1}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	pool.CloseAndWait()
+
+	pending, err := s.LoadPendingTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("dead-lettered task still pending: %d", len(pending))
+	}
+	dead, err := s.LoadDeadLetters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dead) != 1 || dead[0].Task.ID != "poison" {
+		t.Errorf("dead letters = %v, want [poison]", dead)
+	}
+}
+
+// --- Store satisfies the quelon interfaces at compile time ---
+
+var (
+	_ quelon.Store       = (*pebblestore.Store)(nil)
+	_ quelon.CommitStore = (*pebblestore.Store)(nil)
+)

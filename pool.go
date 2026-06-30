@@ -12,18 +12,28 @@ import (
 )
 
 type Pool struct {
-	jobs         chan Task
-	results      chan Result
-	store        Store
-	storeEnabled bool
-	process      ProcessFunc
-	policy       RetryPolicy
-	hooks        Hooks
-	timeout      time.Duration
-	encode       func(any) ([]byte, error)
-	decode       func([]byte) (any, error)
-	logger       *slog.Logger
-	wg           sync.WaitGroup
+	jobs               chan Task
+	results            chan Result
+	store              Store
+	persistPending     bool // persist pending tasks (write-ahead log) — PersistAll
+	persistDeadLetters bool // persist dead letters — PersistDeadLettersOnly or PersistAll
+	process            ProcessFunc
+	policy             RetryPolicy
+	hooks              Hooks
+	timeout            time.Duration
+	encode             func(any) ([]byte, error)
+	decode             func([]byte) (any, error)
+	logger             *slog.Logger
+	wg                 sync.WaitGroup
+
+	// Group-commit writer: a single goroutine owns all store mutations,
+	// batching them into one durable commit per flush window so ingestion never
+	// pays a per-task fsync. See commit.go.
+	ops           chan storeOp
+	writerDone    chan struct{}
+	writerRunning bool
+	flushSize     int           // flush when this many ops accumulate
+	flushEvery    time.Duration // ...or this long since the window opened
 
 	batchEnabled bool
 	maxBatchSize int
@@ -49,10 +59,43 @@ type ProcessFunc func(ctx context.Context, payload any) error
 
 type Option func(*Pool)
 
+// WithStore attaches a durable Store in PersistAll mode: pending tasks are
+// persisted (write-ahead) and dead letters are archived. Use WithStoreMode to
+// pick a different PersistMode.
 func WithStore(s Store) Option {
+	return WithStoreMode(s, PersistAll)
+}
+
+// WithStoreMode attaches a Store and selects what it is used for. See
+// PersistMode for the trade-offs: PersistDeadLettersOnly keeps ingestion fully
+// decoupled from the store (no crash recovery of pending work), while
+// PersistAll persists pending tasks through the group-commit writer.
+func WithStoreMode(s Store, mode PersistMode) Option {
 	return func(p *Pool) {
 		p.store = s
-		p.storeEnabled = true
+		switch mode {
+		case PersistAll:
+			p.persistPending = true
+			p.persistDeadLetters = true
+		case PersistDeadLettersOnly:
+			p.persistDeadLetters = true
+		}
+	}
+}
+
+// WithGroupCommit tunes the durability/throughput trade-off of the store
+// writer. The writer flushes a durable commit when `size` operations accumulate
+// or `every` elapses since the window opened, whichever comes first — one fsync
+// per flush. Smaller values tighten the crash-loss window; larger values raise
+// throughput. size < 1 and every <= 0 are ignored. Defaults: 256 ops / 5ms.
+func WithGroupCommit(size int, every time.Duration) Option {
+	return func(p *Pool) {
+		if size >= 1 {
+			p.flushSize = size
+		}
+		if every > 0 {
+			p.flushEvery = every
+		}
 	}
 }
 
@@ -186,10 +229,10 @@ func NewPoolWithBatch(process BatchProcessFunc, opts ...Option) *Pool {
 // mode-defining process function is set by the exported constructors.
 func newPool(opts ...Option) *Pool {
 	p := &Pool{
-		store:         NoopStore{},
-		policy:        DefaultRetryPolicy,
-		timeout:       30 * time.Second,
-		encode:        func(v any) ([]byte, error) { return json.Marshal(v) },
+		store:   NoopStore{},
+		policy:  DefaultRetryPolicy,
+		timeout: 30 * time.Second,
+		encode:  func(v any) ([]byte, error) { return json.Marshal(v) },
 		decode: func(b []byte) (any, error) {
 			var v any
 			return v, json.Unmarshal(b, &v)
@@ -197,9 +240,12 @@ func newPool(opts ...Option) *Pool {
 		logger:        nil,
 		scaleInterval: 100 * time.Millisecond,
 		idleTimeout:   1 * time.Second,
+		flushSize:     256,
+		flushEvery:    5 * time.Millisecond,
 		quit:          make(chan struct{}),
 		superDone:     make(chan struct{}),
 		closing:       make(chan struct{}),
+		writerDone:    make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -211,6 +257,7 @@ func newPool(opts ...Option) *Pool {
 	}
 	p.jobs = make(chan Task, p.bufferSize)
 	p.results = make(chan Result, p.bufferSize)
+	p.ops = make(chan storeOp, p.bufferSize)
 
 	// A policy with MaxAttempts < 1 would skip the retry loop entirely and
 	// report every task as succeeded without ever invoking process, silently
@@ -258,7 +305,12 @@ func (p *Pool) Start(ctx context.Context) error {
 		go p.supervise(ctx)
 	}
 
-	if p.storeEnabled {
+	if p.persistPending || p.persistDeadLetters {
+		p.writerRunning = true
+		go p.commitLoop()
+	}
+
+	if p.persistPending {
 		rawTasks, err := p.store.LoadPendingTasks()
 		if err != nil {
 			return fmt.Errorf("loading pending tasks: %w", err)
@@ -286,14 +338,25 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		t.EnqueuedAt = time.Now()
 	}
 
-	if p.storeEnabled {
+	// Queue the save before enqueuing the task. The task can't be picked up — and
+	// so can't have its completion delete queued — until it is in p.jobs, so the
+	// writer always observes the save ahead of the delete. The reverse order
+	// would let a fast worker's delete land in an earlier flush window than the
+	// save, leaving a durable pending record for an already-finished task that
+	// would wrongly replay on restart.
+	persisted := false
+	if p.persistPending {
 		encoded, err := p.encode(t.Payload)
 		if err != nil {
-			return fmt.Errorf("encoding payload for task %s: %w", t.ID, err)
-		}
-		raw := RawTask{ID: t.ID, Payload: encoded, EnqueuedAt: t.EnqueuedAt, Attempt: t.Attempt}
-		if err := p.store.SaveTask(raw); err != nil {
-			return fmt.Errorf("persisting task %s: %w", t.ID, err)
+			// The task can still be processed in memory; it just won't have a
+			// durable pending record. Surface the failure without rejecting it.
+			p.storeErr(fmt.Errorf("encoding payload for task %s: %w", t.ID, err))
+		} else {
+			p.queueOp(storeOp{
+				kind: opSave,
+				task: RawTask{ID: t.ID, Payload: encoded, EnqueuedAt: t.EnqueuedAt, Attempt: t.Attempt},
+			})
+			persisted = true
 		}
 	}
 
@@ -304,22 +367,13 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		}
 		return nil
 	default:
-		p.rollbackSubmit(t.ID)
+		// Rejected after the save was queued: queue a compensating delete so the
+		// task the caller was told was not accepted isn't left pending. It
+		// coalesces with the save in the writer's window.
+		if persisted {
+			p.queueOp(storeOp{kind: opDelete, id: t.ID})
+		}
 		return ErrBufferFull
-	}
-}
-
-// rollbackSubmit removes a task that Submit persisted but could not enqueue. The
-// store write happens before the enqueue so an accepted task is always durable;
-// when the enqueue is rejected the caller is told it was not accepted, so the
-// persisted copy must be cleaned up — otherwise Start would silently re-enqueue
-// an "orphan" the caller believes it never submitted.
-func (p *Pool) rollbackSubmit(id string) {
-	if !p.storeEnabled {
-		return
-	}
-	if err := p.store.DeleteTask(id); err != nil && p.hooks.OnStoreError != nil {
-		p.hooks.OnStoreError(fmt.Errorf("rolling back unenqueued task %s: %w", id, err))
 	}
 }
 
@@ -341,6 +395,13 @@ func (p *Pool) CloseAndWait() {
 	// result is emitted, so a dropped result loses no authoritative state.
 	close(p.closing)
 	p.wg.Wait()
+	// Workers have stopped, so no more store ops will be queued. Close the op
+	// channel and let the writer commit its final window before we return —
+	// every task outcome is durably recorded before CloseAndWait completes.
+	if p.writerRunning {
+		close(p.ops)
+		<-p.writerDone
+	}
 	close(p.results)
 }
 
@@ -467,17 +528,17 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 			FailedAt:  time.Now(),
 		}
 
-		if p.storeEnabled {
+		if p.persistDeadLetters {
 			encoded, _ := p.encode(task.Payload)
-			raw := RawDeadLetter{
-				Task:      RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
-				Err:       dl.Err,
-				Permanent: dl.Permanent,
-				FailedAt:  dl.FailedAt,
-			}
-			if saveErr := p.store.SaveDeadLetter(raw); saveErr != nil && p.hooks.OnStoreError != nil {
-				p.hooks.OnStoreError(fmt.Errorf("saving dead letter for task %s: %w", task.ID, saveErr))
-			}
+			p.queueOp(storeOp{
+				kind: opDeadLetter,
+				dl: RawDeadLetter{
+					Task:      RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+					Err:       dl.Err,
+					Permanent: dl.Permanent,
+					FailedAt:  dl.FailedAt,
+				},
+			})
 		}
 
 		p.log(
@@ -505,14 +566,12 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 		}
 	}
 
-	// Remove the task from the pending store only after its outcome has been
-	// durably recorded (dead letter persisted above, or success). Deleting
-	// first would leave a crash window in which the task is neither pending nor
-	// dead-lettered, silently losing it.
-	if p.storeEnabled {
-		if delErr := p.store.DeleteTask(task.ID); delErr != nil && p.hooks.OnStoreError != nil {
-			p.hooks.OnStoreError(fmt.Errorf("deleting completed task %s: %w", task.ID, delErr))
-		}
+	// Remove the task from the pending store once its outcome has been recorded.
+	// The dead-letter op above is queued before this delete op, and the writer
+	// applies dead letters before deletes within a window, so a failed task is
+	// never deleted from pending before it is durable as a dead letter.
+	if p.persistPending {
+		p.queueOp(storeOp{kind: opDelete, id: task.ID})
 	}
 
 	p.emit(ctx, Result{Task: task, Err: err})
@@ -573,20 +632,18 @@ func (p *Pool) runWithRetry(ctx context.Context, task *Task) error {
 // process crashes between retries, the reloaded task resumes with its remaining
 // budget instead of a fresh one. No-op without a store.
 func (p *Pool) persistAttempt(task *Task) {
-	if !p.storeEnabled {
+	if !p.persistPending {
 		return
 	}
 	encoded, err := p.encode(task.Payload)
 	if err != nil {
-		if p.hooks.OnStoreError != nil {
-			p.hooks.OnStoreError(fmt.Errorf("encoding task %s to persist attempt: %w", task.ID, err))
-		}
+		p.storeErr(fmt.Errorf("encoding task %s to persist attempt: %w", task.ID, err))
 		return
 	}
-	raw := RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt}
-	if err := p.store.SaveTask(raw); err != nil && p.hooks.OnStoreError != nil {
-		p.hooks.OnStoreError(fmt.Errorf("persisting attempt for task %s: %w", task.ID, err))
-	}
+	p.queueOp(storeOp{
+		kind: opSave,
+		task: RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+	})
 }
 
 func (p *Pool) runOnce(parent context.Context, payload any) (err error) {
