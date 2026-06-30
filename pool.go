@@ -40,6 +40,9 @@ type Pool struct {
 	quit           chan struct{} // closed by CloseAndWait to stop the supervisor
 	superDone      chan struct{} // closed when the supervisor goroutine exits
 	closing        chan struct{} // closed by CloseAndWait to release workers blocked emitting results
+
+	bufferSize  int // set via WithBufferSize; defaults to runtime.NumCPU()*10
+	workerCount int // set via WithWorkerCount; defaults to runtime.NumCPU()
 }
 
 type ProcessFunc func(ctx context.Context, payload any) error
@@ -88,6 +91,26 @@ func WithLogger(l *slog.Logger) Option {
 //
 // min < 1 is clamped to 1; max < min is clamped to min; a scaleThreshold
 // outside (0,1] defaults to 0.5.
+func WithBufferSize(n int) Option {
+	return func(p *Pool) { p.bufferSize = n }
+}
+
+func WithWorkerCount(n int) Option {
+	return func(p *Pool) { p.workerCount = n }
+}
+
+func WithMaxBatchSize(n int) Option {
+	return func(p *Pool) {
+		if n >= 1 {
+			p.maxBatchSize = n
+		}
+	}
+}
+
+func WithMaxBatchWait(d time.Duration) Option {
+	return func(p *Pool) { p.maxBatchWait = d }
+}
+
 func WithDynamicWorkers(min, max int, scaleThreshold float64) Option {
 	return func(p *Pool) {
 		if min < 1 {
@@ -122,8 +145,8 @@ func (p *Pool) log(level slog.Level, msg string, args ...any) {
 // NewPool creates a pool that processes one task per call to process. Run it
 // with Start and feed it with Submit. For batch processing (message consumers
 // that handle many messages per call), use NewPoolWithBatch instead.
-func NewPool(bufferSize int, process ProcessFunc, opts ...Option) *Pool {
-	p := newPool(bufferSize, opts...)
+func NewPool(process ProcessFunc, opts ...Option) *Pool {
+	p := newPool(opts...)
 	p.process = process
 	return p
 }
@@ -149,33 +172,24 @@ func NewPool(bufferSize int, process ProcessFunc, opts ...Option) *Pool {
 // maxSize < 1 is clamped to 1. Batching composes with the same options as
 // NewPool (WithStore, WithDynamicWorkers, WithRetryPolicy, …); producers keep
 // calling Submit with individual tasks.
-func NewPoolWithBatch(bufferSize, maxSize int, maxWait time.Duration, process BatchProcessFunc, opts ...Option) *Pool {
-	if maxSize < 1 {
-		maxSize = 1
-	}
-	p := newPool(bufferSize, opts...)
+func NewPoolWithBatch(process BatchProcessFunc, opts ...Option) *Pool {
+	p := newPool(opts...)
 	p.batchEnabled = true
-	p.maxBatchSize = maxSize
-	p.maxBatchWait = maxWait
+	if p.maxBatchSize < 1 {
+		p.maxBatchSize = 10
+	}
 	p.batchProcess = process
 	return p
 }
 
 // newPool builds a pool with default configuration and applies opts. The
 // mode-defining process function is set by the exported constructors.
-func newPool(bufferSize int, opts ...Option) *Pool {
-	cpus := runtime.NumCPU()
-	if bufferSize == 0 {
-		bufferSize = cpus * 10
-	}
-
+func newPool(opts ...Option) *Pool {
 	p := &Pool{
-		jobs:    make(chan Task, bufferSize),
-		results: make(chan Result, bufferSize),
-		store:   NoopStore{},
-		policy:  DefaultRetryPolicy,
-		timeout: 30 * time.Second,
-		encode:  func(v any) ([]byte, error) { return json.Marshal(v) },
+		store:         NoopStore{},
+		policy:        DefaultRetryPolicy,
+		timeout:       30 * time.Second,
+		encode:        func(v any) ([]byte, error) { return json.Marshal(v) },
 		decode: func(b []byte) (any, error) {
 			var v any
 			return v, json.Unmarshal(b, &v)
@@ -192,6 +206,12 @@ func newPool(bufferSize int, opts ...Option) *Pool {
 		opt(p)
 	}
 
+	if p.bufferSize == 0 {
+		p.bufferSize = runtime.NumCPU() * 10
+	}
+	p.jobs = make(chan Task, p.bufferSize)
+	p.results = make(chan Result, p.bufferSize)
+
 	// A policy with MaxAttempts < 1 would skip the retry loop entirely and
 	// report every task as succeeded without ever invoking process, silently
 	// dropping work. At least one attempt is always required.
@@ -202,10 +222,11 @@ func newPool(bufferSize int, opts ...Option) *Pool {
 	return p
 }
 
-func (p *Pool) Start(ctx context.Context, workerCount int) error {
+func (p *Pool) Start(ctx context.Context) error {
+	workerCount := p.workerCount
 	if p.dynamic {
 		// In dynamic mode the worker count is governed by min/max; the
-		// workerCount argument is ignored in favour of the configured floor.
+		// workerCount option is ignored in favour of the configured floor.
 		workerCount = p.minWorkers
 	} else if workerCount == 0 {
 		workerCount = runtime.NumCPU()

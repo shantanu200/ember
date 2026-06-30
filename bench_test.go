@@ -7,11 +7,11 @@ import (
 )
 
 func BenchmarkPool_Throughput(b *testing.B) {
-	pool := NewPool(b.N, func(_ context.Context, _ any) error {
+	pool := NewPool(func(_ context.Context, _ any) error {
 		return nil
-	}, WithRetryPolicy(fastPolicy(1)))
+	}, WithBufferSize(b.N), WithWorkerCount(4), WithRetryPolicy(fastPolicy(1)))
 
-	pool.Start(context.Background(), 4)
+	pool.Start(context.Background())
 
 	go func() {
 		for range pool.Results() {
@@ -28,11 +28,11 @@ func BenchmarkPool_Throughput(b *testing.B) {
 func BenchmarkPool_WorkerScaling(b *testing.B) {
 	for _, workers := range []int{1, 2, 4, 8, 16} {
 		b.Run(fmt.Sprintf("workers-%d", workers), func(b *testing.B) {
-			pool := NewPool(b.N, func(_ context.Context, _ any) error {
+			pool := NewPool(func(_ context.Context, _ any) error {
 				return nil
-			}, WithRetryPolicy(fastPolicy(1)))
+			}, WithBufferSize(b.N), WithWorkerCount(workers), WithRetryPolicy(fastPolicy(1)))
 
-			pool.Start(context.Background(), workers)
+			pool.Start(context.Background())
 
 			go func() {
 				for range pool.Results() {
@@ -50,15 +50,15 @@ func BenchmarkPool_WorkerScaling(b *testing.B) {
 
 func BenchmarkPool_WithRetry(b *testing.B) {
 	var attempt int
-	pool := NewPool(b.N, func(_ context.Context, _ any) error {
+	pool := NewPool(func(_ context.Context, _ any) error {
 		attempt++
 		if attempt%3 != 0 {
 			return fmt.Errorf("transient")
 		}
 		return nil
-	}, WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}))
+	}, WithBufferSize(b.N), WithWorkerCount(4), WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}))
 
-	pool.Start(context.Background(), 4)
+	pool.Start(context.Background())
 
 	go func() {
 		for range pool.Results() {
@@ -73,11 +73,11 @@ func BenchmarkPool_WithRetry(b *testing.B) {
 }
 
 func BenchmarkPool_Submit(b *testing.B) {
-	pool := NewPool(b.N+1, func(_ context.Context, _ any) error {
+	pool := NewPool(func(_ context.Context, _ any) error {
 		return nil
-	}, WithRetryPolicy(fastPolicy(1)))
+	}, WithBufferSize(b.N+1), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)))
 
-	pool.Start(context.Background(), 1)
+	pool.Start(context.Background())
 
 	go func() {
 		for range pool.Results() {

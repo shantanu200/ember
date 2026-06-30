@@ -37,14 +37,15 @@ import (
 func main() {
 	ctx := context.Background()
 
-	// bufferSize 0 defaults to runtime.NumCPU() * 10.
-	pool := quelon.NewPool(128, func(ctx context.Context, payload any) error {
+	pool := quelon.NewPool(func(ctx context.Context, payload any) error {
 		fmt.Printf("processing %v\n", payload)
 		return nil
-	})
+	},
+		quelon.WithBufferSize(128), // defaults to runtime.NumCPU()*10
+		quelon.WithWorkerCount(4),  // defaults to runtime.NumCPU()
+	)
 
-	// workerCount 0 defaults to runtime.NumCPU().
-	if err := pool.Start(ctx, 4); err != nil {
+	if err := pool.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
 
@@ -89,7 +90,9 @@ func main() {
 ## Options
 
 ```go
-pool := quelon.NewPool(256, process,
+pool := quelon.NewPool(process,
+	quelon.WithBufferSize(256),
+	quelon.WithWorkerCount(8),
 	quelon.WithRetryPolicy(quelon.RetryPolicy{
 		MaxAttempts:  5,
 		BaseDelay:    200 * time.Millisecond,
@@ -106,6 +109,8 @@ pool := quelon.NewPool(256, process,
 
 | Option | Effect |
 |--------|--------|
+| `WithBufferSize(n)` | Job buffer capacity. Default: `runtime.NumCPU()*10`. |
+| `WithWorkerCount(n)` | Number of workers. Default: `runtime.NumCPU()`. |
 | `WithRetryPolicy(r)` | Exponential backoff config. Default: 3 attempts, 200ms base, 10s cap. |
 | `WithTaskTimeout(d)` | Per-attempt context timeout. Default 30s. |
 | `WithHooks(h)` | Success / retry / dead-letter / store-error callbacks. |
@@ -113,6 +118,8 @@ pool := quelon.NewPool(256, process,
 | `WithCodec(enc, dec)` | Custom payload encode/decode for the store. Defaults to JSON. |
 | `WithStore(s)` | Durable task persistence (see below). |
 | `WithDynamicWorkers(min, max, threshold)` | Auto-scale workers (see below). |
+| `WithMaxBatchSize(n)` | Max tasks per batch (`NewPoolWithBatch` only). Default: 10. |
+| `WithMaxBatchWait(d)` | Max wait to fill a batch. 0 = best-effort (`NewPoolWithBatch` only). |
 
 ## Retries and dead-lettering
 
@@ -138,10 +145,11 @@ func process(ctx context.Context, payload any) error {
 `WithDynamicWorkers` lets the pool grow under load and shrink back when idle:
 
 ```go
-pool := quelon.NewPool(1024, process,
+pool := quelon.NewPool(process,
+	quelon.WithBufferSize(1024),
 	quelon.WithDynamicWorkers(4, 64, 0.5), // min, max, scale threshold
 )
-pool.Start(ctx, 0) // workerCount is ignored in dynamic mode; starts at min
+pool.Start(ctx) // starts at min workers; WithWorkerCount is ignored in dynamic mode
 ```
 
 A supervisor samples the job-buffer fill level; when it crosses `threshold` (a fraction in
@@ -156,7 +164,7 @@ than one message at a time. `NewPoolWithBatch` makes each worker pull up to `max
 tasks and hand them to a batch processor, while multiple workers still run in parallel:
 
 ```go
-pool := quelon.NewPoolWithBatch(1024, 100, 50*time.Millisecond,
+pool := quelon.NewPoolWithBatch(
 	func(ctx context.Context, tasks []quelon.Task) []error {
 		errs := make([]error, len(tasks)) // errs[i] belongs to tasks[i]; nil = success
 		rows := make([]Row, len(tasks))
@@ -170,8 +178,12 @@ pool := quelon.NewPoolWithBatch(1024, 100, 50*time.Millisecond,
 		}
 		return errs
 	},
+	quelon.WithBufferSize(1024),
+	quelon.WithMaxBatchSize(100),
+	quelon.WithMaxBatchWait(50*time.Millisecond),
+	quelon.WithWorkerCount(8), // 8 workers, each forming its own batch
 )
-pool.Start(ctx, 8) // 8 workers, each forming its own batch
+pool.Start(ctx)
 
 for _, row := range incoming {
 	pool.Submit(ctx, quelon.Task{ID: row.ID, Payload: row})
@@ -220,7 +232,7 @@ if err != nil {
 }
 defer store.Close()
 
-pool := quelon.NewPool(256, process, quelon.WithStore(store))
+pool := quelon.NewPool(process, quelon.WithBufferSize(256), quelon.WithStore(store))
 ```
 
 Implement the `quelon.Store` interface to back the pool with any other engine (Redis, SQL,
