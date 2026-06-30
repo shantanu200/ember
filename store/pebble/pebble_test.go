@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shantanu200/ember"
-	pebblestore "github.com/shantanu200/ember/store/pebble"
+	"github.com/shantanu200/quelon"
+	pebblestore "github.com/shantanu200/quelon/store/pebble"
 )
 
 func openStore(t *testing.T) *pebblestore.Store {
@@ -22,8 +22,8 @@ func openStore(t *testing.T) *pebblestore.Store {
 	return s
 }
 
-func rawTask(id string) ember.RawTask {
-	return ember.RawTask{
+func rawTask(id string) quelon.RawTask {
+	return quelon.RawTask{
 		ID:         id,
 		Payload:    []byte(`"hello"`),
 		EnqueuedAt: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
@@ -36,7 +36,7 @@ func rawTask(id string) ember.RawTask {
 func TestSaveAndLoadPendingTasks(t *testing.T) {
 	s := openStore(t)
 
-	tasks := []ember.RawTask{rawTask("a"), rawTask("b"), rawTask("c")}
+	tasks := []quelon.RawTask{rawTask("a"), rawTask("b"), rawTask("c")}
 	for _, task := range tasks {
 		if err := s.SaveTask(task); err != nil {
 			t.Fatalf("SaveTask(%s): %v", task.ID, err)
@@ -51,7 +51,7 @@ func TestSaveAndLoadPendingTasks(t *testing.T) {
 		t.Fatalf("got %d tasks, want %d", len(got), len(tasks))
 	}
 
-	byID := make(map[string]ember.RawTask, len(got))
+	byID := make(map[string]quelon.RawTask, len(got))
 	for _, g := range got {
 		byID[g.ID] = g
 	}
@@ -115,7 +115,7 @@ func TestDeleteTaskIdempotent(t *testing.T) {
 func TestSaveAndLoadDeadLetters(t *testing.T) {
 	s := openStore(t)
 
-	dls := []ember.RawDeadLetter{
+	dls := []quelon.RawDeadLetter{
 		{Task: rawTask("d1"), Err: "boom", Permanent: false, FailedAt: time.Now()},
 		{Task: rawTask("d2"), Err: "fatal", Permanent: true, FailedAt: time.Now()},
 	}
@@ -133,7 +133,7 @@ func TestSaveAndLoadDeadLetters(t *testing.T) {
 		t.Fatalf("got %d dead letters, want %d", len(got), len(dls))
 	}
 
-	byID := make(map[string]ember.RawDeadLetter, len(got))
+	byID := make(map[string]quelon.RawDeadLetter, len(got))
 	for _, g := range got {
 		byID[g.Task.ID] = g
 	}
@@ -168,7 +168,7 @@ func TestLoadDeadLettersEmpty(t *testing.T) {
 func TestDeleteDeadLetter(t *testing.T) {
 	s := openStore(t)
 
-	dl := ember.RawDeadLetter{Task: rawTask("d1"), Err: "oops", FailedAt: time.Now()}
+	dl := quelon.RawDeadLetter{Task: rawTask("d1"), Err: "oops", FailedAt: time.Now()}
 	if err := s.SaveDeadLetter(dl); err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestPendingAndDeadKeysDontCollide(t *testing.T) {
 	if err := s.SaveTask(rawTask("shared-id")); err != nil {
 		t.Fatal(err)
 	}
-	dl := ember.RawDeadLetter{Task: rawTask("shared-id"), Err: "fail", FailedAt: time.Now()}
+	dl := quelon.RawDeadLetter{Task: rawTask("shared-id"), Err: "fail", FailedAt: time.Now()}
 	if err := s.SaveDeadLetter(dl); err != nil {
 		t.Fatal(err)
 	}
@@ -222,6 +222,6 @@ func TestPendingAndDeadKeysDontCollide(t *testing.T) {
 	}
 }
 
-// --- Store satisfies the ember.Store interface at compile time ---
+// --- Store satisfies the quelon.Store interface at compile time ---
 
-var _ ember.Store = (*pebblestore.Store)(nil)
+var _ quelon.Store = (*pebblestore.Store)(nil)

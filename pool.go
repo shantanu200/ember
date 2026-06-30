@@ -1,4 +1,4 @@
-package ember
+package quelon
 
 import (
 	"context"
@@ -212,7 +212,7 @@ func (p *Pool) Start(ctx context.Context, workerCount int) error {
 	}
 
 	p.log(
-		slog.LevelInfo, "ember started",
+		slog.LevelInfo, "quelon started",
 		"workers", workerCount,
 		"dynamic", p.dynamic,
 		"min_workers", p.minWorkers,

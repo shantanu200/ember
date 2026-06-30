@@ -1,10 +1,10 @@
-module github.com/shantanu200/ember/store/pebble
+module github.com/shantanu200/quelon/store/pebble
 
 go 1.26.2
 
 require (
 	github.com/cockroachdb/pebble v1.1.5
-	github.com/shantanu200/ember v0.0.0
+	github.com/shantanu200/quelon v0.0.0
 )
 
 require (
@@ -36,4 +36,4 @@ require (
 	google.golang.org/protobuf v1.33.0 // indirect
 )
 
-replace github.com/shantanu200/ember => ../../
+replace github.com/shantanu200/quelon => ../../

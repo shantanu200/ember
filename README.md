@@ -1,4 +1,4 @@
-# ember
+# quelon
 
 A lightweight, concurrent worker pool for Go with retries, dead-lettering, optional
 auto-scaling, and pluggable durable storage.
@@ -12,13 +12,13 @@ separate module so you never pay for what you don't use.
 Core pool (stdlib only):
 
 ```bash
-go get github.com/shantanu200/ember
+go get github.com/shantanu200/quelon
 ```
 
 Optional Pebble-backed durable store (separate module, pulls in `cockroachdb/pebble`):
 
 ```bash
-go get github.com/shantanu200/ember/store/pebble
+go get github.com/shantanu200/quelon/store/pebble
 ```
 
 ## Quick start
@@ -31,14 +31,14 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/shantanu200/ember"
+	"github.com/shantanu200/quelon"
 )
 
 func main() {
 	ctx := context.Background()
 
 	// bufferSize 0 defaults to runtime.NumCPU() * 10.
-	pool := ember.NewPool(128, func(ctx context.Context, payload any) error {
+	pool := quelon.NewPool(128, func(ctx context.Context, payload any) error {
 		fmt.Printf("processing %v\n", payload)
 		return nil
 	})
@@ -58,8 +58,8 @@ func main() {
 	}()
 
 	for i := 0; i < 10; i++ {
-		if err := pool.Submit(ctx, ember.Task{ID: fmt.Sprintf("t-%d", i), Payload: i}); err != nil {
-			log.Printf("submit failed: %v", err) // e.g. ember.ErrBufferFull
+		if err := pool.Submit(ctx, quelon.Task{ID: fmt.Sprintf("t-%d", i), Payload: i}); err != nil {
+			log.Printf("submit failed: %v", err) // e.g. quelon.ErrBufferFull
 		}
 	}
 
@@ -89,18 +89,18 @@ func main() {
 ## Options
 
 ```go
-pool := ember.NewPool(256, process,
-	ember.WithRetryPolicy(ember.RetryPolicy{
+pool := quelon.NewPool(256, process,
+	quelon.WithRetryPolicy(quelon.RetryPolicy{
 		MaxAttempts:  5,
 		BaseDelay:    200 * time.Millisecond,
 		MaxDelay:     10 * time.Second,
 		JitterFactor: 0.5, // 0 = no jitter, 1.0 = full jitter
 	}),
-	ember.WithTaskTimeout(15*time.Second), // per-attempt timeout (default 30s)
-	ember.WithHooks(ember.Hooks{
-		OnDeadLetter: func(dl ember.DeadLetter) { /* alert / metric */ },
+	quelon.WithTaskTimeout(15*time.Second), // per-attempt timeout (default 30s)
+	quelon.WithHooks(quelon.Hooks{
+		OnDeadLetter: func(dl quelon.DeadLetter) { /* alert / metric */ },
 	}),
-	ember.WithLogger(slog.Default()), // off by default
+	quelon.WithLogger(slog.Default()), // off by default
 )
 ```
 
@@ -125,21 +125,21 @@ To fail fast without retrying, wrap the error as permanent:
 ```go
 func process(ctx context.Context, payload any) error {
 	if invalid(payload) {
-		return ember.NewPermanentError(errors.New("bad payload"))
+		return quelon.NewPermanentError(errors.New("bad payload"))
 	}
 	return nil
 }
 ```
 
-`ember.IsPermanent(err)` reports whether an error is permanent.
+`quelon.IsPermanent(err)` reports whether an error is permanent.
 
 ## Auto-scaling workers
 
 `WithDynamicWorkers` lets the pool grow under load and shrink back when idle:
 
 ```go
-pool := ember.NewPool(1024, process,
-	ember.WithDynamicWorkers(4, 64, 0.5), // min, max, scale threshold
+pool := quelon.NewPool(1024, process,
+	quelon.WithDynamicWorkers(4, 64, 0.5), // min, max, scale threshold
 )
 pool.Start(ctx, 0) // workerCount is ignored in dynamic mode; starts at min
 ```
@@ -156,8 +156,8 @@ than one message at a time. `NewPoolWithBatch` makes each worker pull up to `max
 tasks and hand them to a batch processor, while multiple workers still run in parallel:
 
 ```go
-pool := ember.NewPoolWithBatch(1024, 100, 50*time.Millisecond,
-	func(ctx context.Context, tasks []ember.Task) []error {
+pool := quelon.NewPoolWithBatch(1024, 100, 50*time.Millisecond,
+	func(ctx context.Context, tasks []quelon.Task) []error {
 		errs := make([]error, len(tasks)) // errs[i] belongs to tasks[i]; nil = success
 		rows := make([]Row, len(tasks))
 		for i, t := range tasks {
@@ -174,7 +174,7 @@ pool := ember.NewPoolWithBatch(1024, 100, 50*time.Millisecond,
 pool.Start(ctx, 8) // 8 workers, each forming its own batch
 
 for _, row := range incoming {
-	pool.Submit(ctx, ember.Task{ID: row.ID, Payload: row})
+	pool.Submit(ctx, quelon.Task{ID: row.ID, Payload: row})
 }
 ```
 
@@ -184,7 +184,7 @@ never left unflushed. `maxWait <= 0` is best-effort: take whatever is already bu
 without lingering.
 
 **Per-item outcomes.** The processor returns one error per task, indexed to match the
-input slice (`nil` = that task succeeded). ember settles each task individually:
+input slice (`nil` = that task succeeded). quelon settles each task individually:
 
 - successes are acked immediately and fire `OnSuccess`;
 - transient failures are retried **per item** — only the still-failing tasks are
@@ -199,7 +199,7 @@ Batching composes with `WithDynamicWorkers` and `WithStore`; producers keep call
 `Submit` with individual tasks.
 
 A `Store` may optionally implement `BatchStore` (`DeleteTasks`, `SaveDeadLetters`) to
-settle a whole batch in one round-trip; ember falls back to the per-item `Store` methods
+settle a whole batch in one round-trip; quelon falls back to the per-item `Store` methods
 when it doesn't.
 
 ## Durable storage
@@ -210,8 +210,8 @@ reloaded and re-enqueued automatically.
 
 ```go
 import (
-	"github.com/shantanu200/ember"
-	pebblestore "github.com/shantanu200/ember/store/pebble"
+	"github.com/shantanu200/quelon"
+	pebblestore "github.com/shantanu200/quelon/store/pebble"
 )
 
 store, err := pebblestore.Open("./data/queue")
@@ -220,10 +220,10 @@ if err != nil {
 }
 defer store.Close()
 
-pool := ember.NewPool(256, process, ember.WithStore(store))
+pool := quelon.NewPool(256, process, quelon.WithStore(store))
 ```
 
-Implement the `ember.Store` interface to back the pool with any other engine (Redis, SQL,
+Implement the `quelon.Store` interface to back the pool with any other engine (Redis, SQL,
 etc.); keeping the interface in the core is what lets heavy implementations live in their own
 submodule without bloating the core's dependency graph.
 

@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/shantanu200/ember"
+	"github.com/shantanu200/quelon"
 )
 
 type Store struct {
@@ -27,7 +27,7 @@ func (s *Store) Close() error {
 func pendingKey(id string) []byte { return []byte("pending:" + id) }
 func deadKey(id string) []byte    { return []byte("dead:" + id) }
 
-func (s *Store) SaveTask(t ember.RawTask) error {
+func (s *Store) SaveTask(t quelon.RawTask) error {
 	data, err := json.Marshal(t)
 	if err != nil {
 		return fmt.Errorf("marshaling task %s: %w", t.ID, err)
@@ -39,7 +39,7 @@ func (s *Store) DeleteTask(id string) error {
 	return s.db.Delete(pendingKey(id), pebble.Sync)
 }
 
-func (s *Store) LoadPendingTasks() ([]ember.RawTask, error) {
+func (s *Store) LoadPendingTasks() ([]quelon.RawTask, error) {
 	lower := []byte("pending:")
 	upper := []byte("pending;")
 
@@ -49,9 +49,9 @@ func (s *Store) LoadPendingTasks() ([]ember.RawTask, error) {
 	}
 	defer iter.Close()
 
-	var out []ember.RawTask
+	var out []quelon.RawTask
 	for iter.First(); iter.Valid(); iter.Next() {
-		var t ember.RawTask
+		var t quelon.RawTask
 		if err := json.Unmarshal(iter.Value(), &t); err != nil {
 			return nil, fmt.Errorf("unmarshaling pending task: %w", err)
 		}
@@ -60,7 +60,7 @@ func (s *Store) LoadPendingTasks() ([]ember.RawTask, error) {
 	return out, iter.Error()
 }
 
-func (s *Store) SaveDeadLetter(dl ember.RawDeadLetter) error {
+func (s *Store) SaveDeadLetter(dl quelon.RawDeadLetter) error {
 	data, err := json.Marshal(dl)
 	if err != nil {
 		return fmt.Errorf("marshaling dead letter for task %s: %w", dl.Task.ID, err)
@@ -68,7 +68,7 @@ func (s *Store) SaveDeadLetter(dl ember.RawDeadLetter) error {
 	return s.db.Set(deadKey(dl.Task.ID), data, pebble.Sync)
 }
 
-func (s *Store) LoadDeadLetters() ([]ember.RawDeadLetter, error) {
+func (s *Store) LoadDeadLetters() ([]quelon.RawDeadLetter, error) {
 	lower := []byte("dead:")
 	upper := []byte("dead;")
 
@@ -78,9 +78,9 @@ func (s *Store) LoadDeadLetters() ([]ember.RawDeadLetter, error) {
 	}
 	defer iter.Close()
 
-	var out []ember.RawDeadLetter
+	var out []quelon.RawDeadLetter
 	for iter.First(); iter.Valid(); iter.Next() {
-		var dl ember.RawDeadLetter
+		var dl quelon.RawDeadLetter
 		if err := json.Unmarshal(iter.Value(), &dl); err != nil {
 			return nil, fmt.Errorf("unmarshaling dead letter: %w", err)
 		}

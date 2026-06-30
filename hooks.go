@@ -1,4 +1,4 @@
-package ember
+package quelon
 
 type Hooks struct {
 	OnSuccess    func(Task)

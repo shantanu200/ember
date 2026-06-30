@@ -1,4 +1,4 @@
-package ember
+package quelon
 
 import (
 	"errors"
@@ -36,7 +36,7 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &pe)
 }
 
-var ErrBufferFull = errors.New("ember: job buffer full")
+var ErrBufferFull = errors.New("quelon: job buffer full")
 
 var DefaultRetryPolicy = RetryPolicy{
 	MaxAttempts: 3,

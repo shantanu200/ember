@@ -1,3 +1,3 @@
-module github.com/shantanu200/ember
+module github.com/shantanu200/quelon
 
 go 1.26.2

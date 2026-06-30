@@ -1,4 +1,4 @@
-package ember
+package quelon
 
 import (
 	"context"
@@ -542,10 +542,10 @@ func TestLoggerStartup(t *testing.T) {
 	for range pool.Results() {
 	}
 
-	if !h.hasMessage("ember started") {
-		t.Fatalf("expected 'ember started' log; got %v", h.messages())
+	if !h.hasMessage("quelon started") {
+		t.Fatalf("expected 'quelon started' log; got %v", h.messages())
 	}
-	if v, ok := h.attrFor("ember started", "workers"); !ok || v != "2" {
+	if v, ok := h.attrFor("quelon started", "workers"); !ok || v != "2" {
 		t.Errorf("expected workers=2, got %q (ok=%v)", v, ok)
 	}
 }
