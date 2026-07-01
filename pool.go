@@ -41,6 +41,7 @@ type Pool struct {
 	batchProcess BatchProcessFunc
 
 	dynamic        bool
+	machineAware   bool // set via WithMachineAwareLimit; clamps maxWorkers to GOMAXPROCS
 	minWorkers     int
 	maxWorkers     int
 	scaleThreshold float64       // jobs-buffer fill fraction that triggers scale-up
@@ -172,6 +173,19 @@ func WithDynamicWorkers(min, max int, scaleThreshold float64) Option {
 	}
 }
 
+// WithMachineAwareLimit clamps maxWorkers (set via WithDynamicWorkers) to
+// runtime.GOMAXPROCS(0) if the configured max exceeds it, logging a warning.
+// GOMAXPROCS reflects the GOMAXPROCS env var when set, so it also honors
+// container/cgroup CPU quotas when paired with a library that sets GOMAXPROCS
+// from the cgroup limit (e.g. uber-go/automaxprocs).
+//
+// This is opt-in: callers with I/O-bound workloads commonly and legitimately
+// run more goroutine-workers than CPU cores, so no clamping happens unless
+// this option is set.
+func WithMachineAwareLimit() Option {
+	return func(p *Pool) { p.machineAware = true }
+}
+
 // ActiveWorkers returns the current number of running workers, including any
 // burst workers spawned by the dynamic scaler.
 func (p *Pool) ActiveWorkers() int {
@@ -250,6 +264,20 @@ func newPool(opts ...Option) *Pool {
 
 	for _, opt := range opts {
 		opt(p)
+	}
+
+	if p.dynamic && p.machineAware {
+		if capacity := runtime.GOMAXPROCS(0); p.maxWorkers > capacity {
+			p.log(
+				slog.LevelWarn, "clamping max_workers to machine capacity",
+				"configured_max_workers", p.maxWorkers,
+				"machine_capacity", capacity,
+			)
+			p.maxWorkers = capacity
+			if p.minWorkers > p.maxWorkers {
+				p.minWorkers = p.maxWorkers
+			}
+		}
 	}
 
 	if p.bufferSize == 0 {

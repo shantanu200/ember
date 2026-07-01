@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1002,5 +1003,113 @@ func TestDynamicWorkersCleanShutdown(t *testing.T) {
 
 	if a := pool.ActiveWorkers(); a != 0 {
 		t.Errorf("active workers after shutdown = %d, want 0", a)
+	}
+}
+
+func TestMachineAwareLimitClampsOverProvisionedMax(t *testing.T) {
+	capacity := runtime.GOMAXPROCS(0)
+	handler, logger := newTestLogger()
+
+	pool := newPool(
+		WithLogger(logger),
+		WithDynamicWorkers(2, capacity+10, 0.5),
+		WithMachineAwareLimit(),
+	)
+
+	if pool.maxWorkers != capacity {
+		t.Fatalf("maxWorkers = %d, want clamped to capacity %d", pool.maxWorkers, capacity)
+	}
+	if !handler.hasMessage("clamping max_workers to machine capacity") {
+		t.Fatal("expected a clamp warning to be logged")
+	}
+	if got, ok := handler.attrFor("clamping max_workers to machine capacity", "configured_max_workers"); !ok || got != fmt.Sprint(capacity+10) {
+		t.Fatalf("configured_max_workers attr = %q, want %d", got, capacity+10)
+	}
+	if got, ok := handler.attrFor("clamping max_workers to machine capacity", "machine_capacity"); !ok || got != fmt.Sprint(capacity) {
+		t.Fatalf("machine_capacity attr = %q, want %d", got, capacity)
+	}
+}
+
+func TestMachineAwareLimitClampsMinWhenAboveNewMax(t *testing.T) {
+	capacity := runtime.GOMAXPROCS(0)
+	_, logger := newTestLogger()
+
+	// min itself exceeds the machine's capacity, so after max is clamped down
+	// to capacity, min must be pulled down too or min > max would leave the
+	// pool in an inconsistent state.
+	pool := newPool(
+		WithLogger(logger),
+		WithDynamicWorkers(capacity+5, capacity+10, 0.5),
+		WithMachineAwareLimit(),
+	)
+
+	if pool.maxWorkers != capacity {
+		t.Fatalf("maxWorkers = %d, want %d", pool.maxWorkers, capacity)
+	}
+	if pool.minWorkers != capacity {
+		t.Fatalf("minWorkers = %d, want pulled down to %d", pool.minWorkers, capacity)
+	}
+}
+
+func TestMachineAwareLimitNoopWhenNotOptedIn(t *testing.T) {
+	capacity := runtime.GOMAXPROCS(0)
+	_, logger := newTestLogger()
+
+	// Same over-provisioned max as the clamp test above, but without
+	// WithMachineAwareLimit: existing I/O-bound callers must see no change.
+	pool := newPool(
+		WithLogger(logger),
+		WithDynamicWorkers(2, capacity+10, 0.5),
+	)
+
+	if pool.maxWorkers != capacity+10 {
+		t.Fatalf("maxWorkers = %d, want left untouched at %d", pool.maxWorkers, capacity+10)
+	}
+}
+
+func TestMachineAwareLimitNoopWhenWithinCapacity(t *testing.T) {
+	capacity := runtime.GOMAXPROCS(0)
+	handler, logger := newTestLogger()
+
+	// max exactly equals capacity: the boundary must NOT trigger a clamp or a
+	// warning log (condition is strictly greater-than).
+	pool := newPool(
+		WithLogger(logger),
+		WithDynamicWorkers(1, capacity, 0.5),
+		WithMachineAwareLimit(),
+	)
+
+	if pool.maxWorkers != capacity {
+		t.Fatalf("maxWorkers = %d, want unchanged at %d", pool.maxWorkers, capacity)
+	}
+	if handler.hasMessage("clamping max_workers to machine capacity") {
+		t.Fatal("did not expect a clamp warning when max == capacity")
+	}
+}
+
+func TestMachineAwareLimitNoopWithoutDynamicWorkers(t *testing.T) {
+	// WithMachineAwareLimit with no WithDynamicWorkers call: dynamic mode is
+	// off, so there's no maxWorkers to clamp — must not panic or set dynamic.
+	pool := newPool(WithMachineAwareLimit())
+
+	if pool.dynamic {
+		t.Fatal("expected dynamic to remain false without WithDynamicWorkers")
+	}
+	if pool.maxWorkers != 0 {
+		t.Fatalf("maxWorkers = %d, want 0 (untouched)", pool.maxWorkers)
+	}
+}
+
+func TestMachineAwareLimitNoLoggerConfigured(t *testing.T) {
+	capacity := runtime.GOMAXPROCS(0)
+
+	// No WithLogger: p.log must no-op safely rather than panic on a nil logger.
+	pool := newPool(
+		WithDynamicWorkers(2, capacity+10, 0.5),
+		WithMachineAwareLimit(),
+	)
+
+	if pool.maxWorkers != capacity {
+		t.Fatalf("maxWorkers = %d, want clamped to %d even without a logger", pool.maxWorkers, capacity)
 	}
 }
