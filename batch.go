@@ -151,7 +151,7 @@ func (p *Pool) handleBatch(ctx context.Context, batch []Task) {
 			p.queueOp(storeOp{
 				kind: opDeadLetter,
 				dl: RawDeadLetter{
-					Task:      RawTask{ID: task.ID, Key: task.Key, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+					Task:      RawTask{ID: task.ID, Key: task.Key, Seq: task.Seq, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
 					Err:       dl.Err,
 					Permanent: dl.Permanent,
 					FailedAt:  dl.FailedAt,

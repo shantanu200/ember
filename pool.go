@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,6 +64,11 @@ type Pool struct {
 	// default) keeps the shared work-stealing channel.
 	partitions int
 	shards     []chan Task
+
+	// seq is the monotonic submission counter stamped onto each task by Submit.
+	// After a reload it resumes above the highest recovered Seq so post-restart
+	// work always sorts after replayed work.
+	seq atomic.Uint64
 }
 
 type ProcessFunc func(ctx context.Context, payload any) error
@@ -406,15 +412,28 @@ func (p *Pool) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("loading pending tasks: %w", err)
 		}
+		// Replay in submission (Seq) order regardless of the order the store
+		// returns them, so same-key tasks re-enter their lane in the order they
+		// were originally submitted — restoring per-key FIFO across a crash.
+		sort.Slice(rawTasks, func(i, j int) bool { return rawTasks[i].Seq < rawTasks[j].Seq })
+		var maxSeq uint64
 		for _, r := range rawTasks {
 			payload, err := p.decode(r.Payload)
 			if err != nil {
 				return fmt.Errorf("decoding pending task %s: %w", r.ID, err)
 			}
+			if r.Seq > maxSeq {
+				maxSeq = r.Seq
+			}
 			// Route reloaded tasks through the same lane function as Submit so a
 			// persisted Key keeps replayed same-key tasks on one serial lane.
-			t := Task{ID: r.ID, Key: r.Key, Payload: payload, EnqueuedAt: r.EnqueuedAt, Attempt: r.Attempt}
+			t := Task{ID: r.ID, Key: r.Key, Seq: r.Seq, Payload: payload, EnqueuedAt: r.EnqueuedAt, Attempt: r.Attempt}
 			p.jobsFor(t) <- t
+		}
+		// Resume the submission counter above every recovered Seq so tasks
+		// submitted after restart sort after the replayed ones.
+		if cur := p.seq.Load(); maxSeq > cur {
+			p.seq.Store(maxSeq)
 		}
 	}
 
@@ -432,6 +451,10 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		t.EnqueuedAt = time.Now()
 	}
 
+	// Stamp the submission sequence. It is pool-owned (any caller-set value is
+	// overwritten) and monotonic, so it can order replayed tasks after a crash.
+	t.Seq = p.seq.Add(1)
+
 	// Queue the save before enqueuing the task. The task can't be picked up — and
 	// so can't have its completion delete queued — until it is in p.jobs, so the
 	// writer always observes the save ahead of the delete. The reverse order
@@ -448,7 +471,7 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		} else {
 			p.queueOp(storeOp{
 				kind: opSave,
-				task: RawTask{ID: t.ID, Key: t.Key, Payload: encoded, EnqueuedAt: t.EnqueuedAt, Attempt: t.Attempt},
+				task: RawTask{ID: t.ID, Key: t.Key, Seq: t.Seq, Payload: encoded, EnqueuedAt: t.EnqueuedAt, Attempt: t.Attempt},
 			})
 			persisted = true
 		}
@@ -692,7 +715,7 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 			p.queueOp(storeOp{
 				kind: opDeadLetter,
 				dl: RawDeadLetter{
-					Task:      RawTask{ID: task.ID, Key: task.Key, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+					Task:      RawTask{ID: task.ID, Key: task.Key, Seq: task.Seq, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
 					Err:       dl.Err,
 					Permanent: dl.Permanent,
 					FailedAt:  dl.FailedAt,
@@ -801,7 +824,7 @@ func (p *Pool) persistAttempt(task *Task) {
 	}
 	p.queueOp(storeOp{
 		kind: opSave,
-		task: RawTask{ID: task.ID, Key: task.Key, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+		task: RawTask{ID: task.ID, Key: task.Key, Seq: task.Seq, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
 	})
 }
 
