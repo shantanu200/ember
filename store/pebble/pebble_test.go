@@ -122,9 +122,15 @@ func TestDeleteTaskIdempotent(t *testing.T) {
 func TestSaveAndLoadDeadLetters(t *testing.T) {
 	s := openStore(t)
 
+	// Fixed timestamps (not time.Now()) so FailedAt round-trip is asserted
+	// deterministically. This is the field that a JSON-tag/field-name mismatch
+	// on RawDeadLetter would silently drop to the zero time — the exact class
+	// of bug this test now guards against.
+	failed1 := time.Date(2026, 7, 1, 13, 28, 47, 0, time.UTC)
+	failed2 := time.Date(2026, 7, 1, 13, 29, 12, 0, time.UTC)
 	dls := []quelon.RawDeadLetter{
-		{Task: rawTask("d1"), Err: "boom", Permanent: false, FailedAt: time.Now()},
-		{Task: rawTask("d2"), Err: "fatal", Permanent: true, FailedAt: time.Now()},
+		{Task: rawTask("d1"), Err: "boom", Permanent: false, FailedAt: failed1},
+		{Task: rawTask("d2"), Err: "fatal", Permanent: true, FailedAt: failed2},
 	}
 	for _, dl := range dls {
 		if err := s.SaveDeadLetter(dl); err != nil {
@@ -155,6 +161,14 @@ func TestSaveAndLoadDeadLetters(t *testing.T) {
 		}
 		if g.Permanent != want.Permanent {
 			t.Errorf("dl %s: Permanent %v, want %v", want.Task.ID, g.Permanent, want.Permanent)
+		}
+		if !g.FailedAt.Equal(want.FailedAt) {
+			t.Errorf("dl %s: FailedAt %v, want %v", want.Task.ID, g.FailedAt, want.FailedAt)
+		}
+		// The nested RawTask carries its own timestamp; assert it survives the
+		// round trip too, since RawTask.EnqueuedAt has the same tag/field risk.
+		if !g.Task.EnqueuedAt.Equal(want.Task.EnqueuedAt) {
+			t.Errorf("dl %s: Task.EnqueuedAt %v, want %v", want.Task.ID, g.Task.EnqueuedAt, want.Task.EnqueuedAt)
 		}
 	}
 }
