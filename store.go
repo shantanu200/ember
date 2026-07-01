@@ -3,17 +3,17 @@ package quelon
 import "time"
 
 type RawTask struct {
-	ID         string
-	Payload    []byte
-	EnqueuedAt time.Time
-	Attempt    int
+	ID         string    `json:"id"`
+	Payload    []byte    `json:"payload"`
+	EnqueuedAt time.Time `json:"enqueued_at"`
+	Attempt    int       `json:"attempt"`
 }
 
 type RawDeadLetter struct {
-	Task      RawTask
-	Err       string
-	Permanent bool
-	FailedAt  time.Time
+	Task      RawTask   `json:"task"`
+	Err       string    `json:"err"`
+	Permanent bool      `json:"permanent"`
+	FailedAt  time.Time `json:"failed_at"`
 }
 
 type Store interface {
