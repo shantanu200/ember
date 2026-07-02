@@ -21,7 +21,7 @@ type BatchProcessFunc func(ctx context.Context, tasks []Task) []error
 // idleTimeout with no work, letting the dynamic scaler shrink back to its floor.
 func (p *Pool) batchWorker(ctx context.Context, ephemeral bool) {
 	for {
-		batch, ok := p.gatherBatch(ctx, ephemeral)
+		batch, ok := p.gatherBatch(ctx, p.jobs, ephemeral)
 		if len(batch) > 0 {
 			p.handleBatch(ctx, batch)
 		}
@@ -37,7 +37,7 @@ func (p *Pool) batchWorker(ctx context.Context, ephemeral bool) {
 // cancelled, or (for ephemeral workers) idleTimeout elapsed before any task
 // arrived. A partial batch collected before a stop signal is still returned for
 // processing, with ok=true, so the next call observes the stop cleanly.
-func (p *Pool) gatherBatch(ctx context.Context, ephemeral bool) ([]Task, bool) {
+func (p *Pool) gatherBatch(ctx context.Context, src chan Task, ephemeral bool) ([]Task, bool) {
 	var (
 		first Task
 		ok    bool
@@ -51,7 +51,7 @@ func (p *Pool) gatherBatch(ctx context.Context, ephemeral bool) ([]Task, bool) {
 			return nil, false
 		case <-idle.C:
 			return nil, false
-		case first, ok = <-p.jobs:
+		case first, ok = <-src:
 			if !ok {
 				return nil, false
 			}
@@ -60,7 +60,7 @@ func (p *Pool) gatherBatch(ctx context.Context, ephemeral bool) ([]Task, bool) {
 		select {
 		case <-ctx.Done():
 			return nil, false
-		case first, ok = <-p.jobs:
+		case first, ok = <-src:
 			if !ok {
 				return nil, false
 			}
@@ -77,7 +77,7 @@ func (p *Pool) gatherBatch(ctx context.Context, ephemeral bool) ([]Task, bool) {
 	if p.maxBatchWait <= 0 {
 		for len(batch) < p.maxBatchSize {
 			select {
-			case t, ok := <-p.jobs:
+			case t, ok := <-src:
 				if !ok {
 					return batch, true
 				}
@@ -97,7 +97,7 @@ func (p *Pool) gatherBatch(ctx context.Context, ephemeral bool) ([]Task, bool) {
 			return batch, true
 		case <-timer.C:
 			return batch, true
-		case t, ok := <-p.jobs:
+		case t, ok := <-src:
 			if !ok {
 				return batch, true
 			}
@@ -151,7 +151,7 @@ func (p *Pool) handleBatch(ctx context.Context, batch []Task) {
 			p.queueOp(storeOp{
 				kind: opDeadLetter,
 				dl: RawDeadLetter{
-					Task:      RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+					Task:      RawTask{ID: task.ID, Key: task.Key, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
 					Err:       dl.Err,
 					Permanent: dl.Permanent,
 					FailedAt:  dl.FailedAt,

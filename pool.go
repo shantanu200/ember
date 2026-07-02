@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"runtime"
 	"sync"
@@ -54,6 +55,14 @@ type Pool struct {
 
 	bufferSize  int // set via WithBufferSize; defaults to runtime.NumCPU()*10
 	workerCount int // set via WithWorkerCount; defaults to runtime.NumCPU()
+
+	// Partitioned (ordered) mode: set via WithPartitions. When partitions > 0 the
+	// single shared jobs channel is replaced by one buffered shard channel per
+	// partition, each drained by exactly one worker, so tasks that hash to the
+	// same shard are processed serially and in submission order. Zero (the
+	// default) keeps the shared work-stealing channel.
+	partitions int
+	shards     []chan Task
 }
 
 type ProcessFunc func(ctx context.Context, payload any) error
@@ -141,6 +150,30 @@ func WithBufferSize(n int) Option {
 
 func WithWorkerCount(n int) Option {
 	return func(p *Pool) { p.workerCount = n }
+}
+
+// WithPartitions enables ordered (partitioned) processing. Instead of one shared
+// job buffer drained by interchangeable workers, the pool runs n partitions,
+// each a buffered lane drained by a single dedicated worker. A task is routed to
+// partition fnv1a(Task.Key) % n, so all tasks sharing a Key land on the same
+// lane and are processed one at a time, in submission order. Tasks with an empty
+// Key carry no ordering constraint and are spread across lanes by their ID.
+//
+// This is the model to reach for when correctness depends on per-key order
+// (event sourcing, CDC, per-account state machines) — the guarantee the default
+// work-stealing pool cannot make. The trade-offs are inherent: a slow or
+// retrying key blocks other keys hashed to its lane (head-of-line blocking), a
+// hot key cannot spread beyond its lane, and the lanes are fixed — so
+// partitioning is mutually exclusive with WithDynamicWorkers (dynamic scaling is
+// disabled, with a warning, when both are set). Each lane is buffered to
+// bufferSize. n < 1 is clamped to 1 (a single global-order lane).
+func WithPartitions(n int) Option {
+	return func(p *Pool) {
+		if n < 1 {
+			n = 1
+		}
+		p.partitions = n
+	}
 }
 
 func WithMaxBatchSize(n int) Option {
@@ -266,6 +299,17 @@ func newPool(opts ...Option) *Pool {
 		opt(p)
 	}
 
+	// Partitioning pins each lane to a single dedicated worker, which is
+	// fundamentally incompatible with a scaler that grows and retires
+	// interchangeable workers on a shared queue. Ordering wins; scaling is off.
+	if p.partitions > 0 && p.dynamic {
+		p.log(
+			slog.LevelWarn, "partitioning disables dynamic worker scaling",
+			"partitions", p.partitions,
+		)
+		p.dynamic = false
+	}
+
 	if p.dynamic && p.machineAware {
 		if capacity := runtime.GOMAXPROCS(0); p.maxWorkers > capacity {
 			p.log(
@@ -286,6 +330,15 @@ func newPool(opts ...Option) *Pool {
 	p.jobs = make(chan Task, p.bufferSize)
 	p.results = make(chan Result, p.bufferSize)
 	p.ops = make(chan storeOp, p.bufferSize)
+
+	// One buffered lane per partition, each drained by a single worker so tasks
+	// on the same lane stay serial and in order.
+	if p.partitions > 0 {
+		p.shards = make([]chan Task, p.partitions)
+		for i := range p.shards {
+			p.shards[i] = make(chan Task, p.bufferSize)
+		}
+	}
 
 	// A policy with MaxAttempts < 1 would skip the retry loop entirely and
 	// report every task as succeeded without ever invoking process, silently
@@ -323,10 +376,20 @@ func (p *Pool) Start(ctx context.Context) error {
 		"max_delay", p.policy.MaxDelay,
 	)
 
-	for i := 0; i < workerCount; i++ {
-		p.activeWorkers.Add(1)
-		p.wg.Add(1)
-		go p.worker(ctx, false)
+	if p.partitions > 0 {
+		// One dedicated worker per lane: the lane's single consumer is what makes
+		// same-key tasks serial and in order.
+		for i := range p.shards {
+			p.activeWorkers.Add(1)
+			p.wg.Add(1)
+			go p.partitionWorker(ctx, p.shards[i])
+		}
+	} else {
+		for i := 0; i < workerCount; i++ {
+			p.activeWorkers.Add(1)
+			p.wg.Add(1)
+			go p.worker(ctx, false)
+		}
 	}
 
 	if p.dynamic {
@@ -348,7 +411,10 @@ func (p *Pool) Start(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("decoding pending task %s: %w", r.ID, err)
 			}
-			p.jobs <- Task{ID: r.ID, Payload: payload, EnqueuedAt: r.EnqueuedAt, Attempt: r.Attempt}
+			// Route reloaded tasks through the same lane function as Submit so a
+			// persisted Key keeps replayed same-key tasks on one serial lane.
+			t := Task{ID: r.ID, Key: r.Key, Payload: payload, EnqueuedAt: r.EnqueuedAt, Attempt: r.Attempt}
+			p.jobsFor(t) <- t
 		}
 	}
 
@@ -382,14 +448,14 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		} else {
 			p.queueOp(storeOp{
 				kind: opSave,
-				task: RawTask{ID: t.ID, Payload: encoded, EnqueuedAt: t.EnqueuedAt, Attempt: t.Attempt},
+				task: RawTask{ID: t.ID, Key: t.Key, Payload: encoded, EnqueuedAt: t.EnqueuedAt, Attempt: t.Attempt},
 			})
 			persisted = true
 		}
 	}
 
 	select {
-	case p.jobs <- t:
+	case p.jobsFor(t) <- t:
 		if p.logger != nil {
 			p.log(slog.LevelDebug, "task submitted", "task_id", t.ID)
 		}
@@ -405,6 +471,31 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 	}
 }
 
+// partitionFor maps an ordering key to a partition index in [0, p.partitions).
+// It is only meaningful in partitioned mode (p.partitions > 0).
+func (p *Pool) partitionFor(key string) int {
+	h := fnv.New32a()
+	// hash.Hash never returns an error on Write.
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(p.partitions))
+}
+
+// jobsFor returns the channel a task should be enqueued on. In the default
+// (unpartitioned) mode that is always the shared jobs channel; in partitioned
+// mode it is the lane for the task's Key. An empty Key carries no ordering
+// constraint, so it is spread across lanes by the task ID rather than piling
+// every unkeyed task onto a single lane.
+func (p *Pool) jobsFor(t Task) chan Task {
+	if p.partitions == 0 {
+		return p.jobs
+	}
+	routeKey := t.Key
+	if routeKey == "" {
+		routeKey = t.ID
+	}
+	return p.shards[p.partitionFor(routeKey)]
+}
+
 func (p *Pool) Results() <-chan Result {
 	return p.results
 }
@@ -417,6 +508,11 @@ func (p *Pool) CloseAndWait() {
 		<-p.superDone
 	}
 	close(p.jobs)
+	// In partitioned mode the workers drain the per-lane shard channels, not the
+	// shared jobs channel, so close each lane to let its worker finish and exit.
+	for _, shard := range p.shards {
+		close(shard)
+	}
 	// Release any worker blocked delivering a result to a consumer that has
 	// stopped draining Results(); without this, wg.Wait below would hang
 	// forever. Task outcomes are already committed (hooks + store) before a
@@ -501,6 +597,41 @@ func (p *Pool) worker(ctx context.Context, ephemeral bool) {
 	}
 }
 
+// partitionWorker is the sole consumer of one partition lane. Because a lane has
+// exactly one worker, tasks on it are handled one at a time, in the order they
+// were enqueued — the ordering guarantee of partitioned mode. It handles both
+// single-task and batch pools (batches are gathered from this lane only, so a
+// batch never mixes keys across partitions). It exits when its lane is closed
+// (CloseAndWait) or ctx is cancelled.
+func (p *Pool) partitionWorker(ctx context.Context, shard chan Task) {
+	defer p.wg.Done()
+	defer p.activeWorkers.Add(-1)
+
+	if p.batchEnabled {
+		for {
+			batch, ok := p.gatherBatch(ctx, shard, false)
+			if len(batch) > 0 {
+				p.handleBatch(ctx, batch)
+			}
+			if !ok {
+				return
+			}
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task, ok := <-shard:
+			if !ok {
+				return
+			}
+			p.handle(ctx, task)
+		}
+	}
+}
+
 // supervise samples the jobs-buffer depth and grows the worker pool toward
 // maxWorkers when it crosses scaleThreshold. Growth is multiplicative for fast
 // reaction to spikes; shrink-back is handled by idle burst workers retiring.
@@ -561,7 +692,7 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 			p.queueOp(storeOp{
 				kind: opDeadLetter,
 				dl: RawDeadLetter{
-					Task:      RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+					Task:      RawTask{ID: task.ID, Key: task.Key, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
 					Err:       dl.Err,
 					Permanent: dl.Permanent,
 					FailedAt:  dl.FailedAt,
@@ -670,7 +801,7 @@ func (p *Pool) persistAttempt(task *Task) {
 	}
 	p.queueOp(storeOp{
 		kind: opSave,
-		task: RawTask{ID: task.ID, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+		task: RawTask{ID: task.ID, Key: task.Key, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
 	})
 }
 

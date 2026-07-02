@@ -119,7 +119,8 @@ pool := quelon.NewPool(process,
 | `WithStore(s)` | Durable task persistence in `PersistAll` mode (see below). |
 | `WithStoreMode(s, mode)` | Durable persistence with an explicit `PersistMode` (see below). |
 | `WithGroupCommit(size, every)` | Tune the store writer: flush every `size` ops or `every` interval. Default: 256 / 5ms. |
-| `WithDynamicWorkers(min, max, threshold)` | Auto-scale workers (see below). |
+| `WithDynamicWorkers(min, max, threshold)` | Auto-scale workers (see below). Mutually exclusive with `WithPartitions`. |
+| `WithPartitions(n)` | Ordered mode: route by `Task.Key` to `n` serial lanes (see below). |
 | `WithMaxBatchSize(n)` | Max tasks per batch (`NewPoolWithBatch` only). Default: 10. |
 | `WithMaxBatchWait(d)` | Max wait to fill a batch. 0 = best-effort (`NewPoolWithBatch` only). |
 
@@ -157,6 +158,35 @@ pool.Start(ctx) // starts at min workers; WithWorkerCount is ignored in dynamic 
 A supervisor samples the job-buffer fill level; when it crosses `threshold` (a fraction in
 `(0,1]`), the worker count grows multiplicatively up to `max`. Burst workers retire after an
 idle period, returning the pool to `min`. Inspect the live count with `pool.ActiveWorkers()`.
+
+## Ordered processing (partitions)
+
+By default any worker can pick up any task, so tasks are processed concurrently
+and can complete out of order — ideal when work is independent, wrong when
+correctness depends on per-key order (event sourcing, CDC, per-account state
+machines). `WithPartitions` gives each task an ordering key and guarantees that
+**tasks sharing a `Key` are processed one at a time, in submission order**, while
+different keys still run in parallel:
+
+```go
+pool := quelon.NewPool(process, quelon.WithPartitions(16))
+
+pool.Submit(ctx, quelon.Task{ID: "e1", Key: acct, Payload: evt}) // same Key → same lane,
+pool.Submit(ctx, quelon.Task{ID: "e2", Key: acct, Payload: evt}) // serial and in order
+```
+
+A task is routed to lane `fnv1a(Key) % n`; each lane is a buffered channel
+(sized to `WithBufferSize`) drained by a single dedicated worker. Tasks with an
+empty `Key` carry no ordering constraint and are spread across lanes by their
+`ID`. The persisted `Key` is honored on reload, so same-key tasks that survive a
+crash return to the same lane.
+
+The trade-offs are inherent to ordering: a slow or **retrying key blocks other
+keys hashed to its lane** (head-of-line blocking), a hot key cannot spread beyond
+its lane, and lanes are fixed — so `WithPartitions` is **mutually exclusive with
+`WithDynamicWorkers`** (dynamic scaling is disabled, with a warning, if both are
+set). Reach for it only on the keys that need order; leave everything else on the
+default work-stealing pool.
 
 ## Batching
 
