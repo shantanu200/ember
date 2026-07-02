@@ -179,7 +179,9 @@ A task is routed to lane `fnv1a(Key) % n`; each lane is a buffered channel
 (sized to `WithBufferSize`) drained by a single dedicated worker. Tasks with an
 empty `Key` carry no ordering constraint and are spread across lanes by their
 `ID`. The persisted `Key` is honored on reload, so same-key tasks that survive a
-crash return to the same lane.
+crash return to the same lane — and each task's monotonic submission sequence
+(`Task.Seq`, stamped by `Submit`) is replayed in order, so per-key FIFO is
+restored even if the store returns pending tasks out of order.
 
 The trade-offs are inherent to ordering: a slow or **retrying key blocks other
 keys hashed to its lane** (head-of-line blocking), a hot key cannot spread beyond

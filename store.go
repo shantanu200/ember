@@ -5,6 +5,7 @@ import "time"
 type RawTask struct {
 	ID         string    `json:"id"`
 	Key        string    `json:"key,omitempty"`
+	Seq        uint64    `json:"seq,omitempty"`
 	Payload    []byte    `json:"payload"`
 	EnqueuedAt time.Time `json:"enqueued_at"`
 	Attempt    int       `json:"attempt"`
