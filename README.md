@@ -246,6 +246,47 @@ A `Store` may optionally implement `BatchStore` (`DeleteTasks`, `SaveDeadLetters
 settle a whole batch in one round-trip; quelon falls back to the per-item `Store` methods
 when it doesn't.
 
+## Event routing with `Mux`
+
+A pool has one `ProcessFunc`. When one pool must handle a *variety* of event types — and
+fan a single event out to several independent reactions — wrap that dispatch in a `Mux`
+instead of hand-writing a type switch. Payloads that implement `Event` (an `EventType()
+string` tag) are routed to the handlers registered for them; registering more than one
+handler for the same event type fans out.
+
+```go
+type BatchCreated struct {
+	BatchID  string   `json:"batchID"`
+	Subjects []string `json:"subjects"`
+	Faculty  []string `json:"faculty"`
+}
+
+func (BatchCreated) EventType() string { return "batch.created" }
+
+mux := quelon.NewMux()
+mux.Handle(BatchCreated{}, facultySvc.OnBatchCreated) // one event…
+mux.Handle(BatchCreated{}, subjectSvc.OnBatchCreated) // …two reactions
+
+pool := quelon.NewPool(mux.Process, mux.Codec(), quelon.WithStore(store))
+pool.Start(ctx)
+
+// Publishers submit the typed event; use Key for per-entity ordering.
+pool.Submit(ctx, quelon.Task{ID: "batch-created-" + id, Key: id, Payload: BatchCreated{...}})
+```
+
+`Mux` also dissolves the construction cycle you hit when a handler's dependencies need the
+pool (to `Submit`) while the pool needs the handler (to process): `mux.Process` is a stable
+method the moment `NewMux()` returns, so you pass it to `NewPool` up front and register
+handlers afterward, once services are wired.
+
+Pass `mux.Codec()` alongside any `WithStore`/`WithStoreMode`: it writes a `{type, data}`
+envelope so a persisted task **replays back into its concrete event type** after a crash.
+Without it the default codec decodes payloads into a generic map, which `Process` cannot
+route. An unroutable task (not an `Event`, or no handler for its type) is dead-lettered, not
+retried. On fan-out the first handler error stops the rest and the whole task retries, so
+handlers must be **idempotent**; if that is not acceptable, submit one task per reaction
+instead so each carries its own retry budget and dead-letter record.
+
 ## Durable storage
 
 By default the pool keeps tasks in memory only (`NoopStore`). Attach a `Store` to persist
