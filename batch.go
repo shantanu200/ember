@@ -20,8 +20,26 @@ type BatchProcessFunc func(ctx context.Context, tasks []Task) []error
 // jobs channel is closed; ephemeral burst workers additionally retire after
 // idleTimeout with no work, letting the dynamic scaler shrink back to its floor.
 func (p *Pool) batchWorker(ctx context.Context, ephemeral bool) {
+	// Owned by this worker's loop and reused across gatherBatch calls (reset,
+	// not recreated) so a busy batch worker doesn't register a fresh runtime
+	// timer on every single batch. idle is only needed for ephemeral workers;
+	// wait only when maxBatchWait bounds the collection window.
+	var idle *time.Timer
+	if ephemeral {
+		idle = time.NewTimer(p.idleTimeout)
+		defer idle.Stop()
+	}
+	var wait *time.Timer
+	if p.maxBatchWait > 0 {
+		wait = time.NewTimer(p.maxBatchWait)
+		if !wait.Stop() {
+			<-wait.C
+		}
+		defer wait.Stop()
+	}
+
 	for {
-		batch, ok := p.gatherBatch(ctx, p.jobs, ephemeral)
+		batch, ok := p.gatherBatch(ctx, p.jobs, ephemeral, idle, wait)
 		if len(batch) > 0 {
 			p.handleBatch(ctx, batch)
 		}
@@ -31,21 +49,39 @@ func (p *Pool) batchWorker(ctx context.Context, ephemeral bool) {
 	}
 }
 
+// resetTimer stops t (draining a pending fire so a stale tick from a previous
+// use can't be observed on the next select) and rearms it for d. Used to reuse
+// one timer across many gatherBatch calls instead of allocating a new one each
+// time.
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+
 // gatherBatch blocks for the first task, then collects more until the batch is
 // full or maxBatchWait elapses. The second return value is false once the
 // worker should stop: the jobs channel was closed with nothing pending, ctx was
 // cancelled, or (for ephemeral workers) idleTimeout elapsed before any task
 // arrived. A partial batch collected before a stop signal is still returned for
 // processing, with ok=true, so the next call observes the stop cleanly.
-func (p *Pool) gatherBatch(ctx context.Context, src chan Task, ephemeral bool) ([]Task, bool) {
+//
+// idle and wait are timers owned by the caller's loop (see batchWorker,
+// partitionWorker) and reset here rather than allocated per call: idle is used
+// (and must be non-nil) only when ephemeral is true; wait is used (and must be
+// non-nil) only when p.maxBatchWait > 0.
+func (p *Pool) gatherBatch(ctx context.Context, src chan Task, ephemeral bool, idle, wait *time.Timer) ([]Task, bool) {
 	var (
 		first Task
 		ok    bool
 	)
 
 	if ephemeral {
-		idle := time.NewTimer(p.idleTimeout)
-		defer idle.Stop()
+		resetTimer(idle, p.idleTimeout)
 		select {
 		case <-ctx.Done():
 			return nil, false
@@ -89,13 +125,12 @@ func (p *Pool) gatherBatch(ctx context.Context, src chan Task, ephemeral bool) (
 		return batch, true
 	}
 
-	timer := time.NewTimer(p.maxBatchWait)
-	defer timer.Stop()
+	resetTimer(wait, p.maxBatchWait)
 	for len(batch) < p.maxBatchSize {
 		select {
 		case <-ctx.Done():
 			return batch, true
-		case <-timer.C:
+		case <-wait.C:
 			return batch, true
 		case t, ok := <-src:
 			if !ok {
@@ -275,8 +310,13 @@ func (p *Pool) runBatchWithRetry(ctx context.Context, batch []Task) []error {
 // every task with the panic error, and a nil or short result from the processor
 // leaves the unaddressed tasks as nil (success).
 func (p *Pool) runBatchOnce(parent context.Context, batch []Task) (errs []error) {
-	ctx, cancel := context.WithTimeout(parent, p.timeout)
-	defer cancel()
+	ctx := parent
+	// See runOnce: a deadline <= 0 skips context.WithTimeout entirely.
+	if p.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(parent, p.timeout)
+		defer cancel()
+	}
 
 	errs = make([]error, len(batch))
 
