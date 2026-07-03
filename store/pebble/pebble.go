@@ -8,10 +8,22 @@ import (
 	"github.com/shantanu200/quelon"
 )
 
+// Store is a quelon.Store (and quelon.CommitStore) backed by a local Pebble
+// LSM-tree database. It is the durable-storage counterpart to quelon's
+// core, which is itself stdlib-only — this package is opt-in specifically so
+// callers who don't need durability never pull in cockroachdb/pebble.
+//
+// Pending tasks and dead letters share one Pebble instance under separate key
+// prefixes ("pending:" and "dead:"), so a single Open gives a Pool everything
+// WithStore needs.
 type Store struct {
 	db *pebble.DB
 }
 
+// Open opens (creating if absent) a Pebble database at path and wraps it in a
+// Store. The caller owns the returned Store's lifetime and must call Close
+// when done, typically after the Pool using it has been shut down via
+// CloseAndWait.
 func Open(path string) (*Store, error) {
 	db, err := pebble.Open(path, &pebble.Options{})
 	if err != nil {
@@ -20,13 +32,23 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+// Close closes the underlying Pebble database. Call it only after the Pool
+// using this Store has fully shut down (CloseAndWait returned), so no
+// in-flight store operation is left writing to a closed database.
 func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// pendingKey and deadKey namespace pending-task and dead-letter records under
+// separate key prefixes in the same Pebble keyspace, so LoadPendingTasks and
+// LoadDeadLetters can each range-scan just their own prefix.
 func pendingKey(id string) []byte { return []byte("pending:" + id) }
 func deadKey(id string) []byte    { return []byte("dead:" + id) }
 
+// SaveTask durably writes a pending task record, fsync'd immediately
+// (pebble.Sync). Prefer letting the pool batch writes via WithGroupCommit —
+// which routes through Commit below — over relying on this per-call path for
+// throughput-sensitive workloads.
 func (s *Store) SaveTask(t quelon.RawTask) error {
 	data, err := json.Marshal(t)
 	if err != nil {
@@ -35,10 +57,15 @@ func (s *Store) SaveTask(t quelon.RawTask) error {
 	return s.db.Set(pendingKey(t.ID), data, pebble.Sync)
 }
 
+// DeleteTask durably removes a pending task record, fsync'd immediately.
 func (s *Store) DeleteTask(id string) error {
 	return s.db.Delete(pendingKey(id), pebble.Sync)
 }
 
+// LoadPendingTasks range-scans every "pending:" key and returns the decoded
+// tasks in Pebble's iteration (key) order — not submission order. Callers
+// needing submission order (as Pool.Start does) must sort by RawTask.Seq
+// themselves.
 func (s *Store) LoadPendingTasks() ([]quelon.RawTask, error) {
 	lower := []byte("pending:")
 	upper := []byte("pending;")
@@ -60,6 +87,7 @@ func (s *Store) LoadPendingTasks() ([]quelon.RawTask, error) {
 	return out, iter.Error()
 }
 
+// SaveDeadLetter durably archives a dead letter, fsync'd immediately.
 func (s *Store) SaveDeadLetter(dl quelon.RawDeadLetter) error {
 	data, err := json.Marshal(dl)
 	if err != nil {
@@ -68,6 +96,8 @@ func (s *Store) SaveDeadLetter(dl quelon.RawDeadLetter) error {
 	return s.db.Set(deadKey(dl.Task.ID), data, pebble.Sync)
 }
 
+// LoadDeadLetters range-scans every "dead:" key and returns the decoded dead
+// letters in Pebble's iteration (key) order.
 func (s *Store) LoadDeadLetters() ([]quelon.RawDeadLetter, error) {
 	lower := []byte("dead:")
 	upper := []byte("dead;")
@@ -89,6 +119,9 @@ func (s *Store) LoadDeadLetters() ([]quelon.RawDeadLetter, error) {
 	return out, iter.Error()
 }
 
+// DeleteDeadLetter durably removes an archived dead letter, fsync'd
+// immediately. The pool itself never calls this; it's for callers that
+// reprocess or discard dead letters out-of-band.
 func (s *Store) DeleteDeadLetter(id string) error {
 	return s.db.Delete(deadKey(id), pebble.Sync)
 }
