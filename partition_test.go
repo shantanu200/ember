@@ -39,7 +39,7 @@ func TestPartitions_SameKeyProcessedSerially(t *testing.T) {
 		return nil
 	}, WithPartitions(8), WithBufferSize(n), WithRetryPolicy(fastPolicy(1)))
 
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	submitAndClose(t, pool, keyedTasks("acct", n))
@@ -64,7 +64,7 @@ func TestPartitions_SameKeyProcessedInOrder(t *testing.T) {
 		return nil
 	}, WithPartitions(4), WithBufferSize(n), WithRetryPolicy(fastPolicy(1)))
 
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	submitAndClose(t, pool, keyedTasks("acct", n))
@@ -104,7 +104,7 @@ func TestPartitions_DifferentKeysRunInParallel(t *testing.T) {
 		return nil
 	}
 
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -113,7 +113,7 @@ func TestPartitions_DifferentKeysRunInParallel(t *testing.T) {
 	wg.Add(1)
 	go func() { defer wg.Done(); results = collectResults(pool) }()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	if err := pool.Submit(ctx, Task{ID: "a", Key: ka, Payload: 1}); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestPartitions_UnkeyedTasksAllProcessed(t *testing.T) {
 		return nil
 	}, WithPartitions(4), WithBufferSize(n), WithRetryPolicy(fastPolicy(1)))
 
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	results := submitAndClose(t, pool, makeTasks(n)) // makeTasks leaves Key empty
@@ -168,7 +168,7 @@ func TestPartitions_OneWorkerPerPartition(t *testing.T) {
 	pool := NewPool(func(_ context.Context, _ any) error { return nil },
 		WithPartitions(parts), WithBufferSize(parts))
 
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	defer pool.CloseAndWait()
@@ -221,7 +221,7 @@ func TestPartitions_ReloadedKeyedTasksStaySerial(t *testing.T) {
 	wg.Add(1)
 	go func() { defer wg.Done(); collectResults(pool) }()
 
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	pool.CloseAndWait()

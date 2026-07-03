@@ -103,7 +103,7 @@ func submitAndClose(t *testing.T, p *Pool, tasks []Task) []Result {
 	}()
 
 	for _, task := range tasks {
-		if err := p.Submit(context.Background(), task); err != nil {
+		if err := p.Submit(t.Context(), task); err != nil {
 			t.Fatalf("Submit(%s): %v", task.ID, err)
 		}
 	}
@@ -131,7 +131,7 @@ func TestAllTasksProcessed(t *testing.T) {
 		return nil
 	}, WithBufferSize(n), WithWorkerCount(4), WithRetryPolicy(fastPolicy(1)))
 
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -162,7 +162,7 @@ func TestSingleWorker(t *testing.T) {
 		return nil
 	}, WithBufferSize(n), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, makeTasks(n))
 
 	if len(order) != n {
@@ -183,7 +183,7 @@ func TestRetryOnTransientError(t *testing.T) {
 		return nil
 	}, WithBufferSize(1), WithWorkerCount(1), WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "hello"}})
 
 	if len(results) != 1 {
@@ -207,7 +207,7 @@ func TestZeroMaxAttemptsStillRunsTask(t *testing.T) {
 		return nil
 	}, WithBufferSize(1), WithWorkerCount(1), WithRetryPolicy(RetryPolicy{MaxAttempts: 0, BaseDelay: 0, MaxDelay: 0}))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if attempts.Load() != 1 {
@@ -223,7 +223,7 @@ func TestExhaustedRetriesProducesError(t *testing.T) {
 		return errors.New("always fails")
 	}, WithBufferSize(1), WithWorkerCount(1), WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if results[0].Err == nil {
@@ -260,7 +260,7 @@ func TestRetryPersistsAdvancingAttempt(t *testing.T) {
 		return errors.New("always fails")
 	}, WithBufferSize(1), WithWorkerCount(1), WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}), WithStore(store))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	// Attempts 0,1,2 run; the durable counter is advanced to 2 before the final
@@ -277,7 +277,7 @@ func TestRetryResumesFromLoadedAttempt(t *testing.T) {
 		return errors.New("always fails")
 	}, WithBufferSize(1), WithWorkerCount(1), WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	// A task reloaded with Attempt 2 (it already used attempts 0 and 1) has a
 	// single try left, not a fresh budget of 3.
 	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x", Attempt: 2}})
@@ -300,7 +300,7 @@ func TestPermanentErrorSkipsRetries(t *testing.T) {
 		return NewPermanentError(errors.New("fatal"))
 	}, WithBufferSize(1), WithWorkerCount(1), WithRetryPolicy(RetryPolicy{MaxAttempts: 5, BaseDelay: 0, MaxDelay: 0}))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if results[0].Err == nil {
@@ -325,7 +325,7 @@ func TestPermanentErrorMarkedInDeadLetter(t *testing.T) {
 		}),
 	)
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if !dl.Permanent {
@@ -358,7 +358,7 @@ func TestDeadLetterHookFired(t *testing.T) {
 		}),
 	)
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, makeTasks(10))
 
 	mu.Lock()
@@ -382,7 +382,7 @@ func TestOnSuccessHookFired(t *testing.T) {
 		}),
 	)
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, makeTasks(5))
 
 	if count.Load() != 5 {
@@ -408,7 +408,7 @@ func TestOnRetryHookFired(t *testing.T) {
 		}),
 	)
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if retries.Load() != 2 {
@@ -419,7 +419,7 @@ func TestOnRetryHookFired(t *testing.T) {
 // --- context cancellation ---
 
 func TestContextCancellationStopsWorkers(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 
 	var started atomic.Int64
 	pool := NewPool(func(ctx context.Context, _ any) error {
@@ -462,7 +462,7 @@ func TestTaskTimeout(t *testing.T) {
 		WithTaskTimeout(50*time.Millisecond),
 	)
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "slow"}})
 
 	if results[0].Err == nil {
@@ -477,7 +477,7 @@ func TestPanicInProcessFuncRecovered(t *testing.T) {
 		panic("unexpected condition")
 	}, WithBufferSize(1), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "boom"}})
 
 	if results[0].Err == nil {
@@ -496,7 +496,7 @@ func TestConcurrentStreamSubmit(t *testing.T) {
 		return nil
 	}, WithBufferSize(n), WithWorkerCount(8), WithRetryPolicy(fastPolicy(1)))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	var wg sync.WaitGroup
 	results := make([]Result, 0, n)
@@ -519,7 +519,7 @@ func TestConcurrentStreamSubmit(t *testing.T) {
 			defer producers.Done()
 			for j := range n / 4 {
 				id := offset*25 + j
-				pool.Submit(context.Background(), Task{ID: fmt.Sprintf("task-%d", id), Payload: id})
+				pool.Submit(t.Context(), Task{ID: fmt.Sprintf("task-%d", id), Payload: id})
 			}
 		}(i)
 	}
@@ -546,7 +546,7 @@ func TestLoggerStartup(t *testing.T) {
 		WithLogger(logger),
 		WithRetryPolicy(fastPolicy(1)),
 	)
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	pool.CloseAndWait()
@@ -571,7 +571,7 @@ func TestLoggerTaskLifecycle(t *testing.T) {
 		WithLogger(logger),
 		WithRetryPolicy(fastPolicy(1)),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	for _, want := range []string{"task submitted", "task started", "task succeeded"} {
@@ -602,7 +602,7 @@ func TestLoggerRetry(t *testing.T) {
 		WithLogger(logger),
 		WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if !h.hasMessage("task retrying") {
@@ -633,7 +633,7 @@ func TestLoggerDeadLetter(t *testing.T) {
 		WithLogger(logger),
 		WithRetryPolicy(fastPolicy(1)),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if !h.hasMessage("task dead-lettered") {
@@ -651,7 +651,7 @@ func TestLoggerDefaultOff(t *testing.T) {
 		WithWorkerCount(1),
 		WithRetryPolicy(fastPolicy(1)),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 	// reaching here without panic is the assertion
 }
@@ -665,13 +665,13 @@ func TestSubmitReturnsErrBufferFull(t *testing.T) {
 		return nil
 	}, WithBufferSize(1), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	// first submit fills the buffer
-	pool.Submit(context.Background(), Task{ID: "t1", Payload: "x"})
+	pool.Submit(t.Context(), Task{ID: "t1", Payload: "x"})
 
 	// second submit should get ErrBufferFull immediately
-	err := pool.Submit(context.Background(), Task{ID: "t2", Payload: "x"})
+	err := pool.Submit(t.Context(), Task{ID: "t2", Payload: "x"})
 	if !errors.Is(err, ErrBufferFull) {
 		t.Errorf("expected ErrBufferFull, got %v", err)
 	}
@@ -686,10 +686,10 @@ func TestCloseAndWaitWithoutResultDrain(t *testing.T) {
 	pool := NewPool(func(_ context.Context, _ any) error {
 		return nil
 	}, WithBufferSize(2), WithWorkerCount(2), WithRetryPolicy(fastPolicy(1)))
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	for i := range 50 {
-		_ = pool.Submit(context.Background(), Task{ID: fmt.Sprintf("t-%d", i), Payload: i})
+		_ = pool.Submit(t.Context(), Task{ID: fmt.Sprintf("t-%d", i), Payload: i})
 	}
 
 	done := make(chan struct{})
@@ -742,7 +742,7 @@ func TestSubmitRollsBackPersistOnReject(t *testing.T) {
 		<-block
 		return nil
 	}, WithBufferSize(1), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)), WithStore(store))
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	go func() {
 		for range pool.Results() {
@@ -752,7 +752,7 @@ func TestSubmitRollsBackPersistOnReject(t *testing.T) {
 	var rejected string
 	for i := range 100 {
 		id := fmt.Sprintf("t-%d", i)
-		if err := pool.Submit(context.Background(), Task{ID: id, Payload: i}); errors.Is(err, ErrBufferFull) {
+		if err := pool.Submit(t.Context(), Task{ID: id, Payload: i}); errors.Is(err, ErrBufferFull) {
 			rejected = id
 			break
 		}
@@ -772,9 +772,9 @@ func TestSubmitRejectsCancelledContext(t *testing.T) {
 	store := newTrackingStore()
 	pool := NewPool(func(_ context.Context, _ any) error { return nil },
 		WithBufferSize(4), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)), WithStore(store))
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	err := pool.Submit(ctx, Task{ID: "t1", Payload: "x"})
@@ -805,7 +805,7 @@ func TestNoStoreSkipsEncoding(t *testing.T) {
 			func(b []byte) (any, error) { return "x", nil },
 		),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if encodeCallCount != 0 {
@@ -829,7 +829,7 @@ func TestWithStoreCallsEncoding(t *testing.T) {
 			func(b []byte) (any, error) { return "x", nil },
 		),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if encodeCallCount == 0 {
@@ -848,7 +848,7 @@ func TestEnqueuedAtAutoSet(t *testing.T) {
 		WithWorkerCount(1),
 		WithRetryPolicy(fastPolicy(1)),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	after := time.Now()
@@ -886,7 +886,7 @@ func TestDynamicWorkersScaleUpAndDown(t *testing.T) {
 	pool.scaleInterval = 5 * time.Millisecond
 	pool.idleTimeout = 60 * time.Millisecond
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	go func() {
 		for range pool.Results() {
 		}
@@ -901,7 +901,7 @@ func TestDynamicWorkersScaleUpAndDown(t *testing.T) {
 	go func() {
 		defer close(floodDone)
 		for i := range 600 {
-			pool.Submit(context.Background(), Task{ID: fmt.Sprintf("t-%d", i), Payload: i})
+			pool.Submit(t.Context(), Task{ID: fmt.Sprintf("t-%d", i), Payload: i})
 		}
 	}()
 
@@ -937,7 +937,7 @@ func TestDynamicWorkersRespectMax(t *testing.T) {
 	pool.scaleInterval = 3 * time.Millisecond
 	pool.idleTimeout = 50 * time.Millisecond
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	go func() {
 		for range pool.Results() {
 		}
@@ -952,7 +952,7 @@ func TestDynamicWorkersRespectMax(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				pool.Submit(context.Background(), Task{ID: "x", Payload: 1})
+				pool.Submit(t.Context(), Task{ID: "x", Payload: 1})
 			}
 		}
 	}()
@@ -987,7 +987,7 @@ func TestDynamicWorkersCleanShutdown(t *testing.T) {
 	)
 	pool.scaleInterval = 5 * time.Millisecond
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	done := make(chan struct{})
 	go func() {
