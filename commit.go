@@ -2,6 +2,8 @@ package quelon
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 )
 
@@ -112,14 +114,11 @@ func (p *Pool) commit(set *opSet) {
 		return
 	}
 
-	saves := make([]RawTask, 0, len(set.saves))
-	for _, t := range set.saves {
-		saves = append(saves, t)
-	}
-	deletes := make([]string, 0, len(set.deletes))
-	for id := range set.deletes {
-		deletes = append(deletes, id)
-	}
+	// AppendSeq into a preallocated slice (rather than slices.Collect) so the
+	// commit-window capacity hint isn't lost — this runs once per flush window,
+	// not per task, but the writer is still a throughput-sensitive path.
+	saves := slices.AppendSeq(make([]RawTask, 0, len(set.saves)), maps.Values(set.saves))
+	deletes := slices.AppendSeq(make([]string, 0, len(set.deletes)), maps.Keys(set.deletes))
 
 	if cs, ok := p.store.(CommitStore); ok {
 		if err := cs.Commit(saves, deletes, set.dls); err != nil {

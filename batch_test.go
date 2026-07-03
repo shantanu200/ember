@@ -36,7 +36,7 @@ func TestBatchAllTasksProcessed(t *testing.T) {
 		WithRetryPolicy(fastPolicy(1)),
 	)
 
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -83,7 +83,7 @@ func TestBatchRespectsMaxSize(t *testing.T) {
 		WithRetryPolicy(fastPolicy(1)),
 	)
 	// Single worker so the buffer is full when the worker grabs its batch.
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	// Pre-fill the buffer before the worker drains it.
 	var wg sync.WaitGroup
@@ -93,7 +93,7 @@ func TestBatchRespectsMaxSize(t *testing.T) {
 		_ = collectResults(pool)
 	}()
 	for _, task := range makeTasks(n) {
-		if err := pool.Submit(context.Background(), task); err != nil {
+		if err := pool.Submit(t.Context(), task); err != nil {
 			t.Fatalf("submit: %v", err)
 		}
 	}
@@ -123,7 +123,7 @@ func TestBatchFlushesOnMaxWait(t *testing.T) {
 		WithWorkerCount(1),
 		WithRetryPolicy(fastPolicy(1)),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	go func() {
 		for range pool.Results() {
 		}
@@ -131,7 +131,7 @@ func TestBatchFlushesOnMaxWait(t *testing.T) {
 
 	// Submit fewer tasks than maxSize; the batch must flush on the timer.
 	for i := range 3 {
-		if err := pool.Submit(context.Background(), Task{ID: fmt.Sprintf("t-%d", i), Payload: i}); err != nil {
+		if err := pool.Submit(t.Context(), Task{ID: fmt.Sprintf("t-%d", i), Payload: i}); err != nil {
 			t.Fatalf("submit: %v", err)
 		}
 	}
@@ -180,7 +180,7 @@ func TestBatchPartialFailureDeadLettersOnlyFailures(t *testing.T) {
 			},
 		}),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	results := submitAndClose(t, pool, makeTasks(n))
 
@@ -234,7 +234,7 @@ func TestBatchRetriesOnlyFailingItems(t *testing.T) {
 		WithWorkerCount(1),
 		WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	results := submitAndClose(t, pool, makeTasks(5))
 
@@ -285,7 +285,7 @@ func TestBatchPermanentErrorSkipsRetries(t *testing.T) {
 		WithWorkerCount(1),
 		WithRetryPolicy(RetryPolicy{MaxAttempts: 5, BaseDelay: 0, MaxDelay: 0}),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	results := submitAndClose(t, pool, makeTasks(3))
 
@@ -313,7 +313,7 @@ func TestBatchExhaustedRetriesDeadLetters(t *testing.T) {
 		WithWorkerCount(1),
 		WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	results := submitAndClose(t, pool, makeTasks(3))
 
@@ -336,7 +336,7 @@ func TestBatchPanicRecovered(t *testing.T) {
 		WithWorkerCount(1),
 		WithRetryPolicy(fastPolicy(1)),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	results := submitAndClose(t, pool, makeTasks(3))
 	if len(results) != 3 {
@@ -361,7 +361,7 @@ func TestBatchNilReturnAllSucceed(t *testing.T) {
 		WithWorkerCount(1),
 		WithRetryPolicy(fastPolicy(1)),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	results := submitAndClose(t, pool, makeTasks(5))
 	for _, r := range results {
@@ -387,7 +387,7 @@ func TestBatchCleanDrainOnClose(t *testing.T) {
 		WithWorkerCount(4),
 		WithRetryPolicy(fastPolicy(1)),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	results := submitAndClose(t, pool, makeTasks(n))
 
@@ -415,7 +415,7 @@ func TestBatchBestEffortNoLinger(t *testing.T) {
 		WithWorkerCount(2),
 		WithRetryPolicy(fastPolicy(1)),
 	)
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	results := submitAndClose(t, pool, makeTasks(n))
 	if int(processed.Load()) != n {
@@ -482,7 +482,7 @@ func TestSingleDeadLetterSavedBeforeDelete(t *testing.T) {
 		return NewPermanentError(errors.New("fail"))
 	}, WithBufferSize(1), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)), WithStore(store))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if got := store.snapshot(); len(got) != 2 || got[0] != "save" || got[1] != "delete" {
@@ -507,7 +507,7 @@ func TestBatchDeadLettersSavedBeforeDelete(t *testing.T) {
 		WithStore(store),
 	)
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, makeTasks(4))
 
 	if got := store.snapshot(); len(got) != 2 || got[0] != "save" || got[1] != "delete" {
@@ -532,7 +532,7 @@ func TestBatchRetryResumesFromLoadedAttempt(t *testing.T) {
 		WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}),
 	)
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	// Each task is reloaded with Attempt 2, so each has a single try left: three
 	// tasks => three processor calls total, then all are dead-lettered.
 	tasks := []Task{
@@ -573,7 +573,7 @@ func TestBatchUsesBatchStore(t *testing.T) {
 		WithStore(store),
 	)
 	// One worker + a buffer pre-fill so the whole set lands in one batch.
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -582,7 +582,7 @@ func TestBatchUsesBatchStore(t *testing.T) {
 		_ = collectResults(pool)
 	}()
 	for _, task := range makeTasks(n) {
-		if err := pool.Submit(context.Background(), task); err != nil {
+		if err := pool.Submit(t.Context(), task); err != nil {
 			t.Fatalf("submit: %v", err)
 		}
 	}

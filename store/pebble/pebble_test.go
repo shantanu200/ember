@@ -299,7 +299,7 @@ func TestPoolGroupCommitLeavesNoPendingOnSuccess(t *testing.T) {
 		quelon.WithRetryPolicy(quelon.RetryPolicy{MaxAttempts: 1}),
 		quelon.WithStore(s),
 	)
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	go func() {
@@ -307,7 +307,7 @@ func TestPoolGroupCommitLeavesNoPendingOnSuccess(t *testing.T) {
 		}
 	}()
 	for i := 0; i < 500; i++ {
-		if err := pool.Submit(context.Background(), quelon.Task{ID: id(i), Payload: i}); err != nil {
+		if err := pool.Submit(t.Context(), quelon.Task{ID: id(i), Payload: i}); err != nil {
 			t.Fatalf("Submit %d: %v", i, err)
 		}
 	}
@@ -334,14 +334,14 @@ func TestPoolGroupCommitPersistsDeadLetter(t *testing.T) {
 		quelon.WithRetryPolicy(quelon.RetryPolicy{MaxAttempts: 1}),
 		quelon.WithStore(s),
 	)
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	go func() {
 		for range pool.Results() {
 		}
 	}()
-	if err := pool.Submit(context.Background(), quelon.Task{ID: "poison", Payload: 1}); err != nil {
+	if err := pool.Submit(t.Context(), quelon.Task{ID: "poison", Payload: 1}); err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
 	pool.CloseAndWait()

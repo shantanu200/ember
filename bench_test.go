@@ -17,7 +17,7 @@ func BenchmarkGatherBatchTimer(b *testing.B) {
 
 	b.Run("NewPerCall", func(b *testing.B) {
 		b.ReportAllocs()
-		for range b.N {
+		for b.Loop() {
 			t := time.NewTimer(wait)
 			t.Stop()
 		}
@@ -30,18 +30,24 @@ func BenchmarkGatherBatchTimer(b *testing.B) {
 			<-t.C
 		}
 		defer t.Stop()
-		for range b.N {
+		for b.Loop() {
 			resetTimer(t, wait)
 		}
 	})
 }
 
+// This and the other Pool_* benchmarks below intentionally keep the b.N-loop
+// form rather than b.Loop(): they size the jobs buffer to b.N up front so
+// every Submit in the loop succeeds (Submit's error is deliberately
+// unchecked). b.Loop() doesn't fix b.N until the loop ends, so it can't
+// support that pattern without restructuring these into a retry-on-full-buffer
+// loop, which would change what's being measured.
 func BenchmarkPool_Throughput(b *testing.B) {
 	pool := NewPool(func(_ context.Context, _ any) error {
 		return nil
 	}, WithBufferSize(b.N), WithWorkerCount(4), WithRetryPolicy(fastPolicy(1)))
 
-	pool.Start(context.Background())
+	pool.Start(b.Context())
 
 	go func() {
 		for range pool.Results() {
@@ -50,7 +56,7 @@ func BenchmarkPool_Throughput(b *testing.B) {
 
 	b.ResetTimer()
 	for i := range b.N {
-		pool.Submit(context.Background(), Task{ID: fmt.Sprintf("%d", i), Payload: i})
+		pool.Submit(b.Context(), Task{ID: fmt.Sprintf("%d", i), Payload: i})
 	}
 	pool.CloseAndWait()
 }
@@ -63,7 +69,7 @@ func BenchmarkPool_Throughput_NoTaskTimeout(b *testing.B) {
 		return nil
 	}, WithBufferSize(b.N), WithWorkerCount(4), WithRetryPolicy(fastPolicy(1)), WithTaskTimeout(0))
 
-	pool.Start(context.Background())
+	pool.Start(b.Context())
 
 	go func() {
 		for range pool.Results() {
@@ -72,7 +78,7 @@ func BenchmarkPool_Throughput_NoTaskTimeout(b *testing.B) {
 
 	b.ResetTimer()
 	for i := range b.N {
-		pool.Submit(context.Background(), Task{ID: fmt.Sprintf("%d", i), Payload: i})
+		pool.Submit(b.Context(), Task{ID: fmt.Sprintf("%d", i), Payload: i})
 	}
 	pool.CloseAndWait()
 }
@@ -84,7 +90,7 @@ func BenchmarkPool_WorkerScaling(b *testing.B) {
 				return nil
 			}, WithBufferSize(b.N), WithWorkerCount(workers), WithRetryPolicy(fastPolicy(1)))
 
-			pool.Start(context.Background())
+			pool.Start(b.Context())
 
 			go func() {
 				for range pool.Results() {
@@ -93,7 +99,7 @@ func BenchmarkPool_WorkerScaling(b *testing.B) {
 
 			b.ResetTimer()
 			for i := range b.N {
-				pool.Submit(context.Background(), Task{ID: fmt.Sprintf("%d", i), Payload: i})
+				pool.Submit(b.Context(), Task{ID: fmt.Sprintf("%d", i), Payload: i})
 			}
 			pool.CloseAndWait()
 		})
@@ -110,7 +116,7 @@ func BenchmarkPool_WithRetry(b *testing.B) {
 		return nil
 	}, WithBufferSize(b.N), WithWorkerCount(4), WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0}))
 
-	pool.Start(context.Background())
+	pool.Start(b.Context())
 
 	go func() {
 		for range pool.Results() {
@@ -119,7 +125,7 @@ func BenchmarkPool_WithRetry(b *testing.B) {
 
 	b.ResetTimer()
 	for i := range b.N {
-		pool.Submit(context.Background(), Task{ID: fmt.Sprintf("%d", i), Payload: i})
+		pool.Submit(b.Context(), Task{ID: fmt.Sprintf("%d", i), Payload: i})
 	}
 	pool.CloseAndWait()
 }
@@ -129,14 +135,14 @@ func BenchmarkPool_Submit(b *testing.B) {
 		return nil
 	}, WithBufferSize(b.N+1), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)))
 
-	pool.Start(context.Background())
+	pool.Start(b.Context())
 
 	go func() {
 		for range pool.Results() {
 		}
 	}()
 
-	ctx := context.Background()
+	ctx := b.Context()
 	task := Task{ID: "bench", Payload: 42}
 
 	b.ResetTimer()

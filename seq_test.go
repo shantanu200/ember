@@ -16,7 +16,7 @@ func TestSubmit_AssignsMonotonicSeq(t *testing.T) {
 
 	pool := NewPool(func(_ context.Context, _ any) error { return nil },
 		WithBufferSize(n), WithRetryPolicy(fastPolicy(1)))
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -78,7 +78,7 @@ func TestPartitions_ReloadReplaysInSeqOrder(t *testing.T) {
 	wg.Add(1)
 	go func() { defer wg.Done(); collectResults(pool) }()
 
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	pool.CloseAndWait()
@@ -129,10 +129,10 @@ func TestSubmit_SeqResumesAboveReloaded(t *testing.T) {
 		}
 	}()
 
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.Submit(context.Background(), Task{ID: "new", Key: "k", Payload: 1}); err != nil {
+	if err := pool.Submit(t.Context(), Task{ID: "new", Key: "k", Payload: 1}); err != nil {
 		t.Fatal(err)
 	}
 	pool.CloseAndWait()

@@ -1,13 +1,14 @@
 package quelon
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
 	"runtime"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -473,14 +474,12 @@ func (p *Pool) Start(ctx context.Context) error {
 		// same-key tasks serial and in order.
 		for i := range p.shards {
 			p.activeWorkers.Add(1)
-			p.wg.Add(1)
-			go p.partitionWorker(ctx, p.shards[i])
+			p.wg.Go(func() { p.partitionWorker(ctx, p.shards[i]) })
 		}
 	} else {
-		for i := 0; i < workerCount; i++ {
+		for range workerCount {
 			p.activeWorkers.Add(1)
-			p.wg.Add(1)
-			go p.worker(ctx, false)
+			p.wg.Go(func() { p.worker(ctx, false) })
 		}
 	}
 
@@ -501,7 +500,7 @@ func (p *Pool) Start(ctx context.Context) error {
 		// Replay in submission (Seq) order regardless of the order the store
 		// returns them, so same-key tasks re-enter their lane in the order they
 		// were originally submitted — restoring per-key FIFO across a crash.
-		sort.Slice(rawTasks, func(i, j int) bool { return rawTasks[i].Seq < rawTasks[j].Seq })
+		slices.SortFunc(rawTasks, func(a, b RawTask) int { return cmp.Compare(a.Seq, b.Seq) })
 		var maxSeq uint64
 		for _, r := range rawTasks {
 			payload, err := p.decode(r.Payload)
@@ -677,7 +676,7 @@ func (p *Pool) emit(ctx context.Context, r Result) {
 // spawned by the dynamic scaler, additionally retire after idleTimeout with no
 // work so the pool can shrink back to its floor.
 func (p *Pool) worker(ctx context.Context, ephemeral bool) {
-	defer p.wg.Done()
+	// wg bookkeeping (Add/Done) is owned by the caller's p.wg.Go(...) wrapper.
 	defer p.activeWorkers.Add(-1)
 
 	if p.batchEnabled {
@@ -730,7 +729,7 @@ func (p *Pool) worker(ctx context.Context, ephemeral bool) {
 // batch never mixes keys across partitions). It exits when its lane is closed
 // (CloseAndWait) or ctx is cancelled.
 func (p *Pool) partitionWorker(ctx context.Context, shard chan Task) {
-	defer p.wg.Done()
+	// wg bookkeeping (Add/Done) is owned by the caller's p.wg.Go(...) wrapper.
 	defer p.activeWorkers.Add(-1)
 
 	if p.batchEnabled {
@@ -796,10 +795,9 @@ func (p *Pool) supervise(ctx context.Context) {
 			}
 
 			target := min(cur*2, p.maxWorkers)
-			for i := cur; i < target; i++ {
+			for range target - cur {
 				p.activeWorkers.Add(1)
-				p.wg.Add(1)
-				go p.worker(ctx, true)
+				p.wg.Go(func() { p.worker(ctx, true) })
 			}
 			p.log(
 				slog.LevelDebug, "scaled up workers",

@@ -64,7 +64,7 @@ func TestGroupCommitPersistsAndDeletesOnSuccess(t *testing.T) {
 		WithBufferSize(8), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)),
 		WithStore(store))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	_, saves, deletes, dls := store.snapshot()
@@ -89,7 +89,7 @@ func TestGroupCommitBatchesManyTasksIntoFewCommits(t *testing.T) {
 		WithBufferSize(n), WithWorkerCount(4), WithRetryPolicy(fastPolicy(1)),
 		WithStore(store), WithGroupCommit(64, 5*time.Millisecond))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, makeTasks(n))
 
 	commits, saves, deletes, _ := store.snapshot()
@@ -117,7 +117,7 @@ func TestPersistDeadLettersOnlySkipsPending(t *testing.T) {
 	}, WithBufferSize(8), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)),
 		WithStoreMode(store, PersistDeadLettersOnly))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "ok", Payload: "good"}, {ID: "bad", Payload: "bad"}})
 
 	_, saves, deletes, dls := store.snapshot()
@@ -144,7 +144,7 @@ func TestGroupCommitDeadLetterAndDeleteTogether(t *testing.T) {
 	}, WithBufferSize(4), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)),
 		WithStore(store))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	_, _, deletes, dls := store.snapshot()
@@ -169,7 +169,7 @@ func TestPersistModeNoneNeverTouchesStore(t *testing.T) {
 	}, WithBufferSize(8), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)),
 		WithStoreMode(store, PersistNone))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "ok", Payload: "good"}, {ID: "bad", Payload: "bad"}})
 
 	commits, saves, deletes, dls := store.snapshot()
@@ -239,7 +239,7 @@ func TestGroupCommitFallsBackToPerItemStoreCalls(t *testing.T) {
 	}, WithBufferSize(8), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)),
 		WithStore(store))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "ok", Payload: "good"}, {ID: "bad", Payload: "bad"}})
 
 	saved, deleted, dls := store.snapshot()
@@ -300,7 +300,7 @@ func TestGroupCommitPrefersBatchStoreOverPerItem(t *testing.T) {
 	}, WithBufferSize(8), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)),
 		WithStore(store))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	store.mu.Lock()
@@ -331,7 +331,7 @@ func TestStoreErrorHookFiredOnCommitFailure(t *testing.T) {
 			mu.Unlock()
 		}}))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if len(results) != 1 || results[0].Err != nil {
@@ -375,7 +375,7 @@ func TestSubmitEncodeFailureSkipsPersistButStillProcesses(t *testing.T) {
 			mu.Unlock()
 		}}))
 
-	pool.Start(context.Background())
+	pool.Start(t.Context())
 	results := submitAndClose(t, pool, []Task{{ID: "t1", Payload: "x"}})
 
 	if len(results) != 1 || results[0].Err != nil {
@@ -404,8 +404,8 @@ func TestGroupCommitFlushesOnTimerWithoutClose(t *testing.T) {
 	}, WithBufferSize(4), WithWorkerCount(1), WithRetryPolicy(fastPolicy(1)),
 		WithStore(store), WithGroupCommit(1000, 20*time.Millisecond))
 
-	pool.Start(context.Background())
-	if err := pool.Submit(context.Background(), Task{ID: "t1", Payload: "x"}); err != nil {
+	pool.Start(t.Context())
+	if err := pool.Submit(t.Context(), Task{ID: "t1", Payload: "x"}); err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
 
@@ -437,7 +437,7 @@ func TestStartResumesPendingTasksFromStore(t *testing.T) {
 		WithStore(store),
 		WithHooks(Hooks{OnSuccess: func(task Task) { gotAttempt = task.Attempt }}))
 
-	if err := pool.Start(context.Background()); err != nil {
+	if err := pool.Start(t.Context()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	go func() {
@@ -459,7 +459,7 @@ func TestStartReturnsErrorWhenLoadPendingTasksFails(t *testing.T) {
 	pool := NewPool(func(_ context.Context, _ any) error { return nil },
 		WithBufferSize(4), WithWorkerCount(1), WithStore(store))
 
-	err := pool.Start(context.Background())
+	err := pool.Start(t.Context())
 	if !errors.Is(err, loadErr) {
 		t.Fatalf("Start error = %v, want wrapping %v", err, loadErr)
 	}
