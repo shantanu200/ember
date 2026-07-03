@@ -2,14 +2,20 @@ package quelon
 
 import "time"
 
+// RawTask is the on-disk counterpart of Task: identical except Payload has
+// already been serialized to bytes by the pool's codec (see WithCodec), so a
+// Store implementation never needs to know the payload's concrete type.
 type RawTask struct {
 	ID         string    `json:"id"`
 	Key        string    `json:"key,omitempty"`
+	Seq        uint64    `json:"seq,omitempty"`
 	Payload    []byte    `json:"payload"`
 	EnqueuedAt time.Time `json:"enqueued_at"`
 	Attempt    int       `json:"attempt"`
 }
 
+// RawDeadLetter is the on-disk counterpart of DeadLetter, carrying a RawTask
+// (serialized payload) instead of a Task.
 type RawDeadLetter struct {
 	Task      RawTask   `json:"task"`
 	Err       string    `json:"err"`
@@ -17,13 +23,34 @@ type RawDeadLetter struct {
 	FailedAt  time.Time `json:"failed_at"`
 }
 
+// Store is the durability interface a Pool writes to and reads from when
+// configured via WithStore/WithStoreMode. Implementations must make each
+// method safe for concurrent use, since the pool's group-commit writer and
+// (for LoadPendingTasks/LoadDeadLetters) Start may call into it. See
+// BatchStore and CommitStore for optional interfaces that let a Store batch
+// or atomically commit multiple operations for better throughput; a Store
+// that implements neither still works correctly, just with a sync per op.
 type Store interface {
+	// SaveTask durably records a task as pending (write-ahead), so it can be
+	// replayed by LoadPendingTasks after a crash. Called on Submit and again
+	// on each retry to advance the persisted Attempt.
 	SaveTask(RawTask) error
+	// DeleteTask removes a task's pending record once its outcome (success or
+	// dead-letter) has been recorded, so it is not replayed on restart.
 	DeleteTask(id string) error
+	// LoadPendingTasks returns every task with a pending record, in any
+	// order — the pool sorts by Seq itself before replaying them.
 	LoadPendingTasks() ([]RawTask, error)
 
+	// SaveDeadLetter durably archives a permanently failed task.
 	SaveDeadLetter(RawDeadLetter) error
+	// LoadDeadLetters returns every archived dead letter. The pool itself
+	// never calls this; it exists for callers building tooling on top of a
+	// Store to inspect or reprocess dead letters.
 	LoadDeadLetters() ([]RawDeadLetter, error)
+	// DeleteDeadLetter removes an archived dead letter, e.g. after a caller
+	// has manually reprocessed or discarded it. The pool itself never calls
+	// this.
 	DeleteDeadLetter(id string) error
 }
 
@@ -71,6 +98,9 @@ const (
 	PersistAll
 )
 
+// NoopStore is a Store that discards everything and loads nothing. It is the
+// default Store when no WithStore/WithStoreMode option is given, giving the
+// pool zero persistence overhead (PersistNone) until the caller opts in.
 type NoopStore struct{}
 
 func (NoopStore) SaveTask(RawTask) error                    { return nil }

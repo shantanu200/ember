@@ -7,11 +7,19 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+// Pool is a concurrent worker pool that consumes Tasks submitted via Submit,
+// runs them through a caller-supplied ProcessFunc (or BatchProcessFunc, in
+// batch mode) with retries and dead-lettering, and reports outcomes on
+// Results. A Pool is built with NewPool or NewPoolWithBatch and a set of
+// Options, started with Start, and must be closed with CloseAndWait to
+// release its goroutines and flush any pending durable state. The zero value
+// is not usable; always construct via NewPool/NewPoolWithBatch.
 type Pool struct {
 	jobs               chan Task
 	results            chan Result
@@ -63,10 +71,22 @@ type Pool struct {
 	// default) keeps the shared work-stealing channel.
 	partitions int
 	shards     []chan Task
+
+	// seq is the monotonic submission counter stamped onto each task by Submit.
+	// After a reload it resumes above the highest recovered Seq so post-restart
+	// work always sorts after replayed work.
+	seq atomic.Uint64
 }
 
+// ProcessFunc handles one Task's payload. Returning a non-nil error retries
+// the task per the pool's RetryPolicy unless the error is a *PermanentError
+// (see NewPermanentError), which skips retries and dead-letters immediately.
+// A panic inside ProcessFunc is recovered and treated as a returned error.
 type ProcessFunc func(ctx context.Context, payload any) error
 
+// Option configures a Pool at construction time. Options are applied in the
+// order passed to NewPool/NewPoolWithBatch, so a later option overrides an
+// earlier one that sets the same field.
 type Option func(*Pool)
 
 // WithStore attaches a durable Store in PersistAll mode: pending tasks are
@@ -109,18 +129,35 @@ func WithGroupCommit(size int, every time.Duration) Option {
 	}
 }
 
+// WithRetryPolicy overrides DefaultRetryPolicy, controlling how many times a
+// failed task is retried and the backoff between attempts. See RetryPolicy.
 func WithRetryPolicy(r RetryPolicy) Option {
 	return func(p *Pool) { p.policy = r }
 }
 
+// WithHooks registers callbacks invoked as tasks move through the pool
+// (success, retry, dead-letter, store error). See Hooks for what each callback
+// receives and when it fires; a hook left nil is simply skipped.
 func WithHooks(h Hooks) Option {
 	return func(p *Pool) { p.hooks = h }
 }
 
+// WithTaskTimeout bounds how long a single call to process (or one batch call,
+// in batch mode) may run before its context is cancelled. Defaults to 30s.
+// d <= 0 disables the per-call deadline entirely: process runs under the
+// caller's ctx (as passed to Start) with no wrapping context.WithTimeout, which
+// avoids a timer-heap allocation and lock on every attempt — worth setting when
+// the workload doesn't need a per-task deadline beyond whatever the caller's
+// ctx already enforces.
 func WithTaskTimeout(d time.Duration) Option {
 	return func(p *Pool) { p.timeout = d }
 }
 
+// WithCodec overrides how task payloads are serialized for durable storage.
+// The default codec is encoding/json. encode runs on every Submit (and on
+// every retry, to durably advance the attempt counter) when persistence is
+// enabled; decode runs once per task when replaying pending work on Start.
+// Both must round-trip the payload type the caller submits.
 func WithCodec(encode func(any) ([]byte, error), decode func([]byte) (any, error)) Option {
 	return func(p *Pool) {
 		p.encode = encode
@@ -134,20 +171,18 @@ func WithLogger(l *slog.Logger) Option {
 	return func(p *Pool) { p.logger = l }
 }
 
-// WithDynamicWorkers enables auto-scaling of the worker pool.
-//
-// The pool starts with min workers. A supervisor samples the jobs-buffer fill
-// level; when it reaches scaleThreshold (a fraction in (0,1]) the worker count
-// is grown — multiplicatively — up to max. Burst workers retire after an idle
-// period, returning the pool to min. This absorbs load spikes without forcing
-// the caller to permanently over-provision workers.
-//
-// min < 1 is clamped to 1; max < min is clamped to min; a scaleThreshold
-// outside (0,1] defaults to 0.5.
+// WithBufferSize sets the capacity of the jobs and results channels (and, in
+// partitioned mode, of each per-partition lane). Defaults to
+// runtime.NumCPU()*10. A larger buffer absorbs bigger bursts before Submit
+// returns ErrBufferFull, at the cost of more queued work sitting in memory
+// (and, with WithStore, more pending records replayed after a crash).
 func WithBufferSize(n int) Option {
 	return func(p *Pool) { p.bufferSize = n }
 }
 
+// WithWorkerCount sets the fixed number of workers draining the jobs channel.
+// Defaults to runtime.NumCPU(). Ignored when WithDynamicWorkers is set, which
+// governs the worker count via min/max instead.
 func WithWorkerCount(n int) Option {
 	return func(p *Pool) { p.workerCount = n }
 }
@@ -176,6 +211,9 @@ func WithPartitions(n int) Option {
 	}
 }
 
+// WithMaxBatchSize caps how many tasks a single call to a BatchProcessFunc
+// receives. Only meaningful for pools created with NewPoolWithBatch, which
+// defaults it to 10. n < 1 is ignored (leaves the current value in place).
 func WithMaxBatchSize(n int) Option {
 	return func(p *Pool) {
 		if n >= 1 {
@@ -184,10 +222,25 @@ func WithMaxBatchSize(n int) Option {
 	}
 }
 
+// WithMaxBatchWait bounds how long a batch worker waits for more tasks after
+// the first one arrives before flushing a partial batch. d <= 0 means
+// best-effort: take whatever is already buffered without lingering. Only
+// meaningful for pools created with NewPoolWithBatch.
 func WithMaxBatchWait(d time.Duration) Option {
 	return func(p *Pool) { p.maxBatchWait = d }
 }
 
+// WithDynamicWorkers enables auto-scaling of the worker pool.
+//
+// The pool starts with min workers. A supervisor samples the jobs-buffer fill
+// level; when it reaches scaleThreshold (a fraction in (0,1]) the worker count
+// is grown — multiplicatively — up to max. Burst workers retire after an idle
+// period, returning the pool to min. This absorbs load spikes without forcing
+// the caller to permanently over-provision workers.
+//
+// min < 1 is clamped to 1; max < min is clamped to min; a scaleThreshold
+// outside (0,1] defaults to 0.5. Mutually exclusive with WithPartitions (see
+// its doc comment).
 func WithDynamicWorkers(min, max int, scaleThreshold float64) Option {
 	return func(p *Pool) {
 		if min < 1 {
@@ -272,6 +325,28 @@ func NewPoolWithBatch(process BatchProcessFunc, opts ...Option) *Pool {
 	return p
 }
 
+// SetProcessFunc assigns or replaces the pool's ProcessFunc. It exists to
+// break wiring cycles where the process func's dependencies need a
+// reference to the Pool itself (e.g. a service that both submits tasks to
+// the pool and is invoked by the pool to process them): construct the Pool
+// with a nil process via NewPool(nil, opts...), hand it out to whatever
+// needs to Submit, build the consumer that needs the Pool, then call
+// SetProcessFunc with the consumer's method right before Start.
+//
+// Must be called before Start; not safe for concurrent use with Start or a
+// running pool. Calling it on a pool built with NewPoolWithBatch has no
+// effect on batch dispatch — use SetBatchProcessFunc instead.
+func (p *Pool) SetProcessFunc(process ProcessFunc) {
+	p.process = process
+}
+
+// SetBatchProcessFunc assigns or replaces the pool's BatchProcessFunc, for
+// the same deferred-wiring use case as SetProcessFunc but for pools built
+// with NewPoolWithBatch. Must be called before Start.
+func (p *Pool) SetBatchProcessFunc(process BatchProcessFunc) {
+	p.batchProcess = process
+}
+
 // newPool builds a pool with default configuration and applies opts. The
 // mode-defining process function is set by the exported constructors.
 func newPool(opts ...Option) *Pool {
@@ -350,7 +425,24 @@ func newPool(opts ...Option) *Pool {
 	return p
 }
 
+// Start launches the pool's workers (and, if configured, the dynamic-scaling
+// supervisor and the durable-store writer), then — when persistence of
+// pending tasks is enabled — replays any tasks left over from a previous
+// run, in their original submission order, before returning. ctx governs the
+// lifetime of every worker: cancelling it stops task processing, but does not
+// by itself release Pool resources — always pair Start with a deferred
+// CloseAndWait. Start returns an error only if replaying persisted tasks
+// fails (e.g. the store or codec errors); the pool is otherwise already
+// accepting Submit calls by the time it returns.
 func (p *Pool) Start(ctx context.Context) error {
+	if p.batchEnabled {
+		if p.batchProcess == nil {
+			return fmt.Errorf("quelon: batch process func is nil; call SetBatchProcessFunc before Start")
+		}
+	} else if p.process == nil {
+		return fmt.Errorf("quelon: process func is nil; call SetProcessFunc before Start")
+	}
+
 	workerCount := p.workerCount
 	if p.dynamic {
 		// In dynamic mode the worker count is governed by min/max; the
@@ -406,21 +498,40 @@ func (p *Pool) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("loading pending tasks: %w", err)
 		}
+		// Replay in submission (Seq) order regardless of the order the store
+		// returns them, so same-key tasks re-enter their lane in the order they
+		// were originally submitted — restoring per-key FIFO across a crash.
+		sort.Slice(rawTasks, func(i, j int) bool { return rawTasks[i].Seq < rawTasks[j].Seq })
+		var maxSeq uint64
 		for _, r := range rawTasks {
 			payload, err := p.decode(r.Payload)
 			if err != nil {
 				return fmt.Errorf("decoding pending task %s: %w", r.ID, err)
 			}
+			if r.Seq > maxSeq {
+				maxSeq = r.Seq
+			}
 			// Route reloaded tasks through the same lane function as Submit so a
 			// persisted Key keeps replayed same-key tasks on one serial lane.
-			t := Task{ID: r.ID, Key: r.Key, Payload: payload, EnqueuedAt: r.EnqueuedAt, Attempt: r.Attempt}
+			t := Task{ID: r.ID, Key: r.Key, Seq: r.Seq, Payload: payload, EnqueuedAt: r.EnqueuedAt, Attempt: r.Attempt}
 			p.jobsFor(t) <- t
+		}
+		// Resume the submission counter above every recovered Seq so tasks
+		// submitted after restart sort after the replayed ones.
+		if cur := p.seq.Load(); maxSeq > cur {
+			p.seq.Store(maxSeq)
 		}
 	}
 
 	return nil
 }
 
+// Submit enqueues a task for processing. It is non-blocking: if the jobs
+// buffer (or, in partitioned mode, the task's lane) is full, Submit returns
+// ErrBufferFull immediately rather than waiting for room. It also returns an
+// error if ctx is already cancelled. Submit overwrites t.Seq and, if unset,
+// t.EnqueuedAt; callers should not rely on either field surviving a Submit
+// call unchanged. Safe for concurrent use by multiple goroutines.
 func (p *Pool) Submit(ctx context.Context, t Task) error {
 	// Submit is non-blocking, so a cancelled context can only be observed here,
 	// up front — there is no blocking send for a ctx.Done() select case to win.
@@ -431,6 +542,10 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 	if t.EnqueuedAt.IsZero() {
 		t.EnqueuedAt = time.Now()
 	}
+
+	// Stamp the submission sequence. It is pool-owned (any caller-set value is
+	// overwritten) and monotonic, so it can order replayed tasks after a crash.
+	t.Seq = p.seq.Add(1)
 
 	// Queue the save before enqueuing the task. The task can't be picked up — and
 	// so can't have its completion delete queued — until it is in p.jobs, so the
@@ -448,7 +563,7 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		} else {
 			p.queueOp(storeOp{
 				kind: opSave,
-				task: RawTask{ID: t.ID, Key: t.Key, Payload: encoded, EnqueuedAt: t.EnqueuedAt, Attempt: t.Attempt},
+				task: RawTask{ID: t.ID, Key: t.Key, Seq: t.Seq, Payload: encoded, EnqueuedAt: t.EnqueuedAt, Attempt: t.Attempt},
 			})
 			persisted = true
 		}
@@ -496,10 +611,21 @@ func (p *Pool) jobsFor(t Task) chan Task {
 	return p.shards[p.partitionFor(routeKey)]
 }
 
+// Results returns the channel of task outcomes, one Result per completed
+// Submit (success or exhausted-retries/dead-letter). Callers should drain it
+// continuously — a full results buffer can eventually block workers via emit,
+// which falls back to waiting on it. The channel is closed by CloseAndWait
+// once every in-flight result has been emitted.
 func (p *Pool) Results() <-chan Result {
 	return p.results
 }
 
+// CloseAndWait stops accepting new work on the internal queues, waits for
+// every worker to finish its current task, flushes any buffered durable-store
+// writes, and closes the Results channel. It blocks until shutdown is
+// complete, so every task outcome submitted before this call is observed
+// (via hooks and, if configured, the store) before CloseAndWait returns. Call
+// it exactly once, typically deferred right after a successful Start.
 func (p *Pool) CloseAndWait() {
 	if p.dynamic {
 		// Stop the supervisor before closing jobs so it can't call wg.Add
@@ -608,8 +734,19 @@ func (p *Pool) partitionWorker(ctx context.Context, shard chan Task) {
 	defer p.activeWorkers.Add(-1)
 
 	if p.batchEnabled {
+		// A partition lane's worker is never ephemeral, so no idle timer is
+		// needed; wait is reused across gatherBatch calls the same way
+		// batchWorker's is.
+		var wait *time.Timer
+		if p.maxBatchWait > 0 {
+			wait = time.NewTimer(p.maxBatchWait)
+			if !wait.Stop() {
+				<-wait.C
+			}
+			defer wait.Stop()
+		}
 		for {
-			batch, ok := p.gatherBatch(ctx, shard, false)
+			batch, ok := p.gatherBatch(ctx, shard, false, nil, wait)
 			if len(batch) > 0 {
 				p.handleBatch(ctx, batch)
 			}
@@ -692,7 +829,7 @@ func (p *Pool) handle(ctx context.Context, task Task) {
 			p.queueOp(storeOp{
 				kind: opDeadLetter,
 				dl: RawDeadLetter{
-					Task:      RawTask{ID: task.ID, Key: task.Key, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+					Task:      RawTask{ID: task.ID, Key: task.Key, Seq: task.Seq, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
 					Err:       dl.Err,
 					Permanent: dl.Permanent,
 					FailedAt:  dl.FailedAt,
@@ -801,13 +938,20 @@ func (p *Pool) persistAttempt(task *Task) {
 	}
 	p.queueOp(storeOp{
 		kind: opSave,
-		task: RawTask{ID: task.ID, Key: task.Key, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
+		task: RawTask{ID: task.ID, Key: task.Key, Seq: task.Seq, Payload: encoded, EnqueuedAt: task.EnqueuedAt, Attempt: task.Attempt},
 	})
 }
 
 func (p *Pool) runOnce(parent context.Context, payload any) (err error) {
-	ctx, cancel := context.WithTimeout(parent, p.timeout)
-	defer cancel()
+	ctx := parent
+	// A deadline <= 0 means no per-call timeout: skip context.WithTimeout, which
+	// otherwise registers a timer (allocation + timer-heap lock) on every single
+	// attempt regardless of how fast process actually returns.
+	if p.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(parent, p.timeout)
+		defer cancel()
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
