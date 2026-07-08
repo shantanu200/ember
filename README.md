@@ -7,6 +7,8 @@ The core library depends only on the standard library — installing it pulls in
 external dependencies**. Durability (persisting tasks across restarts) is opt-in through a
 separate module so you never pay for what you don't use.
 
+Requires Go 1.25+ (uses `sync.WaitGroup.Go`, `b.Loop`, `t.Context`/`b.Context`).
+
 ## Install
 
 Core pool (stdlib only):
@@ -120,6 +122,7 @@ pool := quelon.NewPool(process,
 | `WithStoreMode(s, mode)` | Durable persistence with an explicit `PersistMode` (see below). |
 | `WithGroupCommit(size, every)` | Tune the store writer: flush every `size` ops or `every` interval. Default: 256 / 5ms. |
 | `WithDynamicWorkers(min, max, threshold)` | Auto-scale workers (see below). Mutually exclusive with `WithPartitions`. |
+| `WithMachineAwareLimit()` | Clamp `WithDynamicWorkers`' `max` to `GOMAXPROCS(0)` if it exceeds it (see below). |
 | `WithPartitions(n)` | Ordered mode: route by `Task.Key` to `n` serial lanes (see below). |
 | `WithMaxBatchSize(n)` | Max tasks per batch (`NewPoolWithBatch` only). Default: 10. |
 | `WithMaxBatchWait(d)` | Max wait to fill a batch. 0 = best-effort (`NewPoolWithBatch` only). |
@@ -158,6 +161,13 @@ pool.Start(ctx) // starts at min workers; WithWorkerCount is ignored in dynamic 
 A supervisor samples the job-buffer fill level; when it crosses `threshold` (a fraction in
 `(0,1]`), the worker count grows multiplicatively up to `max`. Burst workers retire after an
 idle period, returning the pool to `min`. Inspect the live count with `pool.ActiveWorkers()`.
+
+`WithMachineAwareLimit()` is an opt-in guard against over-provisioning: if `max` exceeds
+`runtime.GOMAXPROCS(0)`, it's clamped down to it (with a logged warning). `GOMAXPROCS` honors
+container/cgroup CPU quotas when paired with a library that sets it accordingly (e.g.
+`uber-go/automaxprocs`), so this is useful for CPU-bound workloads sized to fit a container.
+It's off by default because I/O-bound workloads legitimately run more goroutine-workers than
+CPU cores.
 
 ## Ordered processing (partitions)
 
