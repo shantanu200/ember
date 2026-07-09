@@ -25,7 +25,7 @@ type Event interface {
 // NewPool up front and register handlers afterward, once services are wired:
 //
 //	mux := quelon.NewMux()
-//	pool := quelon.NewPool(mux.Process, mux.Codec(), quelon.WithStore(store))
+//	pool := mux.NewPool(quelon.WithStore(store)) // codec wired automatically
 //	faculty.Register(mux, facultySvc) // mux.Handle(BatchCreated{}, svc.OnBatchCreated)
 //	subject.Register(mux, subjectSvc)
 //	pool.Start(ctx)
@@ -132,4 +132,18 @@ func (m *Mux) decode(b []byte) (any, error) {
 		return nil, fmt.Errorf("quelon: decoding event %q: %w", env.Type, err)
 	}
 	return ptr.Elem().Interface(), nil
+}
+
+// NewPool builds a Pool wired to m: process routes through m.Process and m's
+// Codec() is applied automatically, so callers never pass encode/decode by
+// hand. Equivalent to:
+//
+//	quelon.NewPool(m.Process, append([]quelon.Option{m.Codec()}, opts...)...)
+//
+// opts are applied after the codec, so an explicit WithCodec in opts still
+// overrides it (see Option's override-by-order rule). Handle may be called
+// before or after NewPool — m.Codec()'s encode/decode read m.proto at call
+// time, not at registration time, so registration order doesn't matter here.
+func (m *Mux) NewPool(opts ...Option) *Pool {
+	return NewPool(m.Process, append([]Option{m.Codec()}, opts...)...)
 }

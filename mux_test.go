@@ -201,9 +201,100 @@ func TestMux_EndToEndWithPool(t *testing.T) {
 
 	const n = 10
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() { defer wg.Done(); collectResults(p) }()
-	for i := 0; i < n; i++ {
+	wg.Go(func() { collectResults(p) })
+	for i := range n {
+		if err := p.Submit(context.Background(), Task{ID: "batch-" + string(rune('a'+i)), Payload: batchCreated{BatchID: "b"}}); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+	}
+	p.CloseAndWait()
+	wg.Wait()
+
+	if faculty.Load() != n || subject.Load() != n {
+		t.Errorf("faculty=%d subject=%d, want %d each", faculty.Load(), subject.Load(), n)
+	}
+}
+
+// --- Mux.NewPool ---
+
+// TestMuxNewPool_WiresCodecAutomatically checks that a pool built via
+// m.NewPool round-trips events through the same codec as an explicit
+// m.Codec(), without the caller passing it.
+func TestMuxNewPool_WiresCodecAutomatically(t *testing.T) {
+	m := NewMux()
+	m.Handle(batchCreated{}, func(_ context.Context, _ any) error { return nil })
+
+	p := m.NewPool()
+
+	orig := batchCreated{BatchID: "b1", Subjects: []string{"math"}}
+	encoded, err := p.encode(orig)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := p.decode(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got, ok := decoded.(batchCreated)
+	if !ok {
+		t.Fatalf("decoded payload is %T, want batchCreated", decoded)
+	}
+	if !reflect.DeepEqual(got, orig) {
+		t.Errorf("round-trip = %+v, want %+v", got, orig)
+	}
+}
+
+// TestMuxNewPool_PassesThroughOtherOptions checks that opts besides the
+// codec still reach the pool, so m.NewPool composes with the rest of the
+// Option surface (WithStore, WithPartitions, WithDynamicWorkers, ...).
+func TestMuxNewPool_PassesThroughOtherOptions(t *testing.T) {
+	m := NewMux()
+	p := m.NewPool(WithWorkerCount(7))
+
+	if p.workerCount != 7 {
+		t.Errorf("workerCount = %d, want 7", p.workerCount)
+	}
+}
+
+// TestMuxNewPool_ExplicitCodecOverrides checks that an explicit WithCodec
+// passed in opts still wins over the auto-added mux codec, per Option's
+// override-by-order rule (a later option beats an earlier one on the same
+// field).
+func TestMuxNewPool_ExplicitCodecOverrides(t *testing.T) {
+	m := NewMux()
+	m.Handle(batchCreated{}, func(_ context.Context, _ any) error { return nil })
+
+	sentinel := errors.New("custom codec used")
+	p := m.NewPool(WithCodec(
+		func(any) ([]byte, error) { return nil, sentinel },
+		func([]byte) (any, error) { return nil, sentinel },
+	))
+
+	if _, err := p.encode(batchCreated{}); !errors.Is(err, sentinel) {
+		t.Errorf("encode err = %v, want sentinel from the explicit codec", err)
+	}
+}
+
+// TestMuxNewPool_EndToEnd exercises m.NewPool the way a caller actually
+// uses it: build the pool before Start, register handlers, submit events,
+// and confirm they route and fan out exactly as with NewPool(m.Process,
+// m.Codec(), ...).
+func TestMuxNewPool_EndToEnd(t *testing.T) {
+	var faculty, subject atomic.Int64
+
+	m := NewMux()
+	p := m.NewPool(WithWorkerCount(4), WithRetryPolicy(fastPolicy(1)))
+	m.Handle(batchCreated{}, func(_ context.Context, _ any) error { faculty.Add(1); return nil })
+	m.Handle(batchCreated{}, func(_ context.Context, _ any) error { subject.Add(1); return nil })
+
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 10
+	var wg sync.WaitGroup
+	wg.Go(func() { collectResults(p) })
+	for i := range n {
 		if err := p.Submit(context.Background(), Task{ID: "batch-" + string(rune('a'+i)), Payload: batchCreated{BatchID: "b"}}); err != nil {
 			t.Fatalf("Submit: %v", err)
 		}
