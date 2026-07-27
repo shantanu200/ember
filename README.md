@@ -411,6 +411,17 @@ by `WithGroupCommit`). A `Store` may implement the optional `CommitStore` interf
 (`Commit(saves, deletes, deadLetters)`) to apply a whole window atomically with one fsync — the
 Pebble store does. Stores without it fall back to per-item `Store`/`BatchStore` calls.
 
+## Examples
+
+Runnable, self-contained programs live in [`examples/`](examples), ordered from basic to
+advanced:
+
+- [`01-basic`](examples/01-basic) — the core loop: `NewPool`, `Submit`, `Results`, retries, dead-lettering.
+- [`02-batch-consumer`](examples/02-batch-consumer) — `NewPoolWithBatch` bulk processing with a durable dead-letter archive.
+- [`03-counter-aggregation`](examples/03-counter-aggregation) — `WithAggregator` + `WithPartitions` coalescing 100k events into a handful of counter writes.
+
+Run any with `go run ./examples/<dir>`.
+
 ## License
 
 See repository.
