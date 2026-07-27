@@ -394,10 +394,14 @@ func TestAggregatorPersistReplaysCoalescedValue(t *testing.T) {
 		total.Add(payload.(incr).Delta)
 		return nil
 	}, WithStore(store), incrCodec(), WithWorkerCount(2), WithRetryPolicy(fastPolicy(1)))
+	// Drain Results before Start: Start replays the recovered pending tasks with
+	// blocking sends, and the workers processing them block on emit once the
+	// Results buffer fills — so a consumer must already be draining, or Start
+	// deadlocks when the backlog exceeds the buffer.
+	drain(poolB)
 	if err := poolB.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	drain(poolB)
 	mustEventually(t, 2*time.Second, "replayed tasks did not all process", func() bool {
 		return total.Load() == persisted
 	})
