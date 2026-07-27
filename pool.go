@@ -77,6 +77,15 @@ type Pool struct {
 	// After a reload it resumes above the highest recovered Seq so post-restart
 	// work always sorts after replayed work.
 	seq atomic.Uint64
+
+	// Ingest-time aggregation: configured via WithAggregator. When aggMerge is
+	// non-nil the pool folds same-key Submit payloads into an in-memory
+	// accumulator (agg) and flushes one coalesced task per key on an interval,
+	// instead of enqueuing every Submit. See aggregator.go.
+	agg           *aggregator
+	aggMerge      MergeFunc
+	aggFlushEvery time.Duration
+	aggMaxKeys    int
 }
 
 // ProcessFunc handles one Task's payload. Returning a non-nil error retries
@@ -423,6 +432,12 @@ func newPool(opts ...Option) *Pool {
 		p.policy.MaxAttempts = 1
 	}
 
+	// Aggregation sits in front of the jobs lanes (built above), folding
+	// same-key Submits and flushing coalesced tasks into them.
+	if p.aggMerge != nil {
+		p.agg = newAggregator(p, p.aggMerge, p.aggFlushEvery, p.aggMaxKeys)
+	}
+
 	return p
 }
 
@@ -522,6 +537,12 @@ func (p *Pool) Start(ctx context.Context) error {
 		}
 	}
 
+	// Launch the flush goroutine last, once the workers draining its output are
+	// running (and any replayed tasks are already enqueued ahead of it).
+	if p.agg != nil {
+		p.agg.start(ctx)
+	}
+
 	return nil
 }
 
@@ -542,16 +563,36 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		t.EnqueuedAt = time.Now()
 	}
 
+	// Aggregating mode: fold the payload into the per-key accumulator instead of
+	// enqueuing. Folding is an in-memory map update, so it never blocks and never
+	// returns ErrBufferFull; the coalesced task is flushed onto a lane later, and
+	// its Seq is stamped then (not here). See aggregator.go.
+	if p.agg != nil {
+		p.agg.fold(t)
+		return nil
+	}
+
 	// Stamp the submission sequence. It is pool-owned (any caller-set value is
 	// overwritten) and monotonic, so it can order replayed tasks after a crash.
 	t.Seq = p.seq.Add(1)
+	return p.dispatch(ctx, t, false)
+}
 
-	// Queue the save before enqueuing the task. The task can't be picked up — and
-	// so can't have its completion delete queued — until it is in p.jobs, so the
-	// writer always observes the save ahead of the delete. The reverse order
-	// would let a fast worker's delete land in an earlier flush window than the
-	// save, leaving a durable pending record for an already-finished task that
-	// would wrongly replay on restart.
+// dispatch persists t (write-ahead, if enabled) and enqueues it onto its lane.
+// With block=false (a normal Submit) a full lane is reported immediately as
+// ErrBufferFull; with block=true (an aggregator flush of an already-coalesced
+// value standing in for many events) it waits for lane room, releasing only on
+// ctx cancellation or pool shutdown so the value is not dropped on a transient
+// full buffer.
+//
+// The save is queued before the send. The task can't be picked up — and so
+// can't have its completion delete queued — until it is on the lane, so the
+// writer always observes the save ahead of the delete. The reverse order would
+// let a fast worker's delete land in an earlier flush window than the save,
+// leaving a durable pending record for an already-finished task that would
+// wrongly replay on restart. A save for a task that is ultimately not enqueued
+// is compensated with a delete so no orphan pending record remains.
+func (p *Pool) dispatch(ctx context.Context, t Task, block bool) error {
 	persisted := false
 	if p.persistPending {
 		encoded, err := p.encode(t.Payload)
@@ -568,16 +609,34 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		}
 	}
 
+	dst := p.jobsFor(t)
+	if !block {
+		select {
+		case dst <- t:
+			if p.logger != nil {
+				p.log(slog.LevelDebug, "task submitted", "task_id", t.ID)
+			}
+			return nil
+		default:
+			if persisted {
+				p.queueOp(storeOp{kind: opDelete, id: t.ID})
+			}
+			return ErrBufferFull
+		}
+	}
+
 	select {
-	case p.jobsFor(t) <- t:
+	case dst <- t:
 		if p.logger != nil {
 			p.log(slog.LevelDebug, "task submitted", "task_id", t.ID)
 		}
 		return nil
-	default:
-		// Rejected after the save was queued: queue a compensating delete so the
-		// task the caller was told was not accepted isn't left pending. It
-		// coalesces with the save in the writer's window.
+	case <-ctx.Done():
+		if persisted {
+			p.queueOp(storeOp{kind: opDelete, id: t.ID})
+		}
+		return ctx.Err()
+	case <-p.closing:
 		if persisted {
 			p.queueOp(storeOp{kind: opDelete, id: t.ID})
 		}
@@ -631,6 +690,12 @@ func (p *Pool) CloseAndWait() {
 		// concurrently with the wg.Wait below.
 		close(p.quit)
 		<-p.superDone
+	}
+	// Stop aggregating and flush every accumulated key onto its lane while the
+	// workers are still draining, so coalesced values are not lost on a graceful
+	// shutdown. Must precede close(p.jobs): the final flush sends on those lanes.
+	if p.agg != nil {
+		p.agg.stopAndDrain()
 	}
 	close(p.jobs)
 	// In partitioned mode the workers drain the per-lane shard channels, not the

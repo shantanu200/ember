@@ -126,6 +126,7 @@ pool := quelon.NewPool(process,
 | `WithPartitions(n)` | Ordered mode: route by `Task.Key` to `n` serial lanes (see below). |
 | `WithMaxBatchSize(n)` | Max tasks per batch (`NewPoolWithBatch` only). Default: 10. |
 | `WithMaxBatchWait(d)` | Max wait to fill a batch. 0 = best-effort (`NewPoolWithBatch` only). |
+| `WithAggregator(merge, every, maxKeys)` | Fold same-key Submits in memory, flush one coalesced task per key every `every` (or at `maxKeys`). See below. |
 
 ## Retries and dead-lettering
 
@@ -257,6 +258,65 @@ Batching composes with `WithDynamicWorkers` and `WithStore`; producers keep call
 A `Store` may optionally implement `BatchStore` (`DeleteTasks`, `SaveDeadLetters`) to
 settle a whole batch in one round-trip; quelon falls back to the per-item `Store` methods
 when it doesn't.
+
+## Coalescing high-fan-in writes (aggregation)
+
+Batching still buffers — and, under `WithStore`, write-ahead-logs — **one task per
+Submit**. For a counter workload (post likes, view counts) that's wasteful: fifty
+thousand `+1`s to one hot key sit as fifty thousand buffered tasks only to be summed
+into a single row update. `WithAggregator` moves the coalescing **to ingest**: same-key
+payloads are folded in memory as they arrive, and one accumulated task per key is flushed
+into the normal pipeline on an interval — turning buffer and log cost from `O(events)`
+into `O(distinct keys)`.
+
+```go
+type incr struct {
+	Key   string // identity: the payload, not Task.Key, is what reaches ProcessFunc
+	Delta int64
+}
+
+pool := quelon.NewPool(
+	func(ctx context.Context, payload any) error {
+		v := payload.(incr)
+		return bulkAdd(ctx, v.Key, v.Delta) // one UPSERT ... SET val = val + delta
+	},
+	quelon.WithAggregator(
+		func(acc, in any) any { // fold: sum the deltas, keep the seeded identity
+			a := acc.(incr)
+			a.Delta += in.(incr).Delta
+			return a
+		},
+		200*time.Millisecond, // flush window
+		50_000,               // maxKeys: flush early once this many keys are live
+	),
+	quelon.WithPartitions(64), // same Key → same lane → still one writer per counter
+)
+pool.Start(ctx)
+
+// The hot path just folds — no bulk write, no lane contention.
+pool.Submit(ctx, quelon.Task{Key: "post:123:likes", Payload: incr{"post:123:likes", 1}})
+```
+
+The **first** payload for a key seeds the accumulator; each later one is combined via your
+`merge`, so `merge` must be **associative — ideally commutative** (integer addition, a
+last-write-wins pick) for partial flushes to combine correctly at the sink. The flushed
+task carries the shared `Key` (so it still routes to one lane under `WithPartitions`,
+coalescing maximally) plus a unique per-flush `ID`.
+
+Trade-offs, made explicit:
+
+- In aggregating mode **`Submit` never returns `ErrBufferFull`** — folding is an in-memory
+  map update. Backpressure surfaces instead as the background flusher waiting for lane room.
+- **`CloseAndWait` drains every accumulator** before shutting down, so a graceful stop loses
+  nothing. An ungraceful stop (cancelling the `Start` ctx) can lose the current unflushed
+  window — the same bounded-loss trade-off `WithGroupCommit` makes for durability.
+- `merge` runs under a shard lock: keep it fast and side-effect-free.
+- `maxKeys <= 0` disables the size trigger (time-based flush only), which risks unbounded
+  memory under high key cardinality — set a cap unless the key space is known-small.
+
+Aggregation composes with `WithStore` (the coalesced task is the unit that's persisted and
+replayed), `WithPartitions`, and batching. It's the right tool only when per-key fan-in is
+high; for independent one-shot tasks, the plain pool or batching is simpler.
 
 ## Event routing with `Mux`
 
