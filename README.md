@@ -70,6 +70,66 @@ func main() {
 }
 ```
 
+## Motivation
+
+Most Go queues force a topology choice up front. Broker-backed queues (Postgres,
+Redis, a message broker) give you durability and retries, but every task is a
+network hop and an operational dependency, and you persist *everything*.
+In-process goroutine pools give you speed and zero dependencies, but a crash
+loses in-flight work and there's no retry or dead-letter story.
+
+quelon collapses that choice: **an async queue that lives inside the server
+process** — same address space, no broker hop — while still keeping a
+write-ahead log and a retry/dead-letter mechanism so accepted work survives
+transient failures and restarts.
+
+```
+             ┌──────────────── your server process ────────────────┐
+  request ──►│ Submit ─► [ in-memory buffer ] ─► workers ─► ProcessFunc
+  handler    │                  │                   │              │
+             │                  ▼                   ▼              ▼
+             │         group-commit WAL         retry w/       dead-letter
+             │         (async, batched)         backoff        archive
+             └──────────────────┬──────────────────────────────────┘
+                                ▼
+                        reload pending on Start
+```
+
+- **Produce and consume in one component.** The server *produces* by calling
+  `Submit` on the request hot path — non-blocking, returns `ErrBufferFull`
+  instead of stalling the handler — and the same pool *consumes* via its worker
+  goroutines. No separate producer/consumer deployment.
+- **The log.** `WithStore` write-ahead-logs each `Submit` through a group-commit
+  writer (one durable commit per flush window, tuned with `WithGroupCommit`), so
+  ingestion never blocks on a per-task fsync; pending tasks reload on `Start`.
+  It's *group-committed durability, not persist-before-ack* — a crash can lose
+  the current flush window (see [Persistence modes](#persistence-modes--who-owns-durability)).
+- **The retry mechanism.** Exponential backoff with jitter, fail-fast permanent
+  errors, and dead-lettering of exhausted tasks — see below.
+
+The core stays zero-dependency, so you get all of this by embedding a package,
+not by standing up another system.
+
+### When not to use quelon
+
+Being in-process is quelon's strength and also its boundary. Reach for something
+else when:
+
+- **You need cross-process or cross-node work distribution.** quelon runs inside
+  one server; it does no routing, sharding, or rebalancing across instances. For
+  a shared queue many services drain, use a broker (Redis/Kafka/SQS) or a
+  DB-backed queue. quelon can sit *behind* one as a node-local consumer.
+- **You need global exactly-once or transactional enqueue.** Durability is
+  group-committed, not persist-before-ack, and retries are at-least-once — so
+  handlers must be idempotent. If a task must commit atomically with your DB
+  transaction, a transactional queue (e.g. a Postgres-backed one) fits better.
+- **You cannot lose a single task on crash.** A crash can drop the current
+  flush window. Shrink it with `WithGroupCommit`, or let an upstream log own
+  durability and run quelon in `PersistDeadLettersOnly`.
+- **Work must outlive the process regardless of restarts, or scale workers
+  independently of the producer.** A separate queue + worker fleet decouples
+  producer and consumer lifecycles in a way an embedded pool cannot.
+
 ## Core concepts
 
 | Type | Purpose |
