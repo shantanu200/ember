@@ -61,6 +61,36 @@ func (m *Mux) Handle(sample Event, h ProcessFunc) {
 	m.proto[key] = t
 }
 
+// On registers h for events of type T. It is the type-safe form of Handle: the
+// Mux still routes by T's EventType tag and fans out the same way, but h
+// receives the concrete event instead of an any that every handler has to type
+// assert.
+//
+//	quelon.On(mux, facultySvc.OnBatchCreated) // func(context.Context, BatchCreated) error
+//
+// On is a function rather than a method because Go methods cannot take type
+// parameters. It derives the type tag from T's zero value, so T must be the
+// value type (BatchCreated, not *BatchCreated) — the same rule Event already
+// imposes for store replay. On panics on a pointer or interface T, at
+// registration time, rather than dead-lettering every such event at runtime.
+func On[T Event](m *Mux, h func(context.Context, T) error) {
+	var zero T
+	t := reflect.TypeFor[T]()
+	if k := t.Kind(); k == reflect.Ptr || k == reflect.Interface {
+		panic(fmt.Sprintf("quelon: On requires a concrete value event type, got %s", t))
+	}
+	m.Handle(zero, func(ctx context.Context, payload any) error {
+		ev, ok := payload.(T)
+		if !ok {
+			// Unreachable through Process, which normalizes pointers and routes by
+			// tag, but a mismatched tag (two types sharing one EventType) would land
+			// here — permanent, since a retry cannot change the payload's type.
+			return NewPermanentError(fmt.Errorf("quelon: event %q arrived as %T, want %s", zero.EventType(), payload, t))
+		}
+		return h(ctx, ev)
+	})
+}
+
 // Process routes payload to the handlers registered for its event type. It is
 // the ProcessFunc you pass to NewPool. A payload that is not an Event, or whose
 // event type has no registered handler, is a permanent failure (dead-lettered,
