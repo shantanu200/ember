@@ -1113,3 +1113,388 @@ func TestMachineAwareLimitNoLoggerConfigured(t *testing.T) {
 		t.Fatalf("maxWorkers = %d, want clamped to %d even without a logger", pool.maxWorkers, capacity)
 	}
 }
+
+// --- WithBlockOnFull ---
+
+// blockedPool returns a started pool whose single worker is parked inside the
+// ProcessFunc and whose one-task buffer is full, so the next Submit has nowhere
+// to go. release unparks the worker and lets the pool drain; done releases (if
+// the test has not already) and shuts the pool down. Both are idempotent, so a
+// test can call release mid-body and still defer done.
+func blockedPool(t *testing.T, opts ...Option) (p *Pool, release func(), processed *atomic.Int64, done func()) {
+	t.Helper()
+
+	gate := make(chan struct{})
+	started := make(chan struct{}, 1)
+	processed = &atomic.Int64{}
+	var once sync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+
+	opts = append([]Option{
+		WithBufferSize(1),
+		WithWorkerCount(1),
+		WithRetryPolicy(fastPolicy(1)),
+	}, opts...)
+	p = NewPool(func(context.Context, any) error {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-gate
+		processed.Add(1)
+		return nil
+	}, opts...)
+
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { collectResults(p) })
+
+	// Park the worker on the first task before filling the buffer: until the
+	// worker has actually dequeued it, the free buffer slot is ambiguous and the
+	// pool's capacity is racy.
+	if err := p.Submit(context.Background(), Task{ID: "occupy"}); err != nil {
+		t.Fatalf("Submit(occupy): %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker never picked up the first task")
+	}
+	// Buffer capacity is 1 and the only worker is parked, so this fills it.
+	if err := p.Submit(context.Background(), Task{ID: "fill"}); err != nil {
+		t.Fatalf("Submit(fill): %v", err)
+	}
+
+	var closeOnce sync.Once
+	return p, release, processed, func() {
+		closeOnce.Do(func() {
+			release()
+			p.CloseAndWait()
+			wg.Wait()
+		})
+	}
+}
+
+// With WithBlockOnFull a Submit that finds no room parks until a worker frees a
+// slot, instead of rejecting the task.
+func TestWithBlockOnFull_WaitsForRoom(t *testing.T) {
+	p, release, processed, done := blockedPool(t, WithBlockOnFull(0))
+	defer done()
+
+	errc := make(chan error, 1)
+	go func() { errc <- p.Submit(context.Background(), Task{ID: "blocked"}) }()
+
+	// The task must still be in Submit: nothing has drained the buffer yet.
+	select {
+	case err := <-errc:
+		t.Fatalf("Submit returned %v while the buffer was full; want it to wait", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	release() // workers drain, freeing the slot the parked Submit needs
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("Submit after room freed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Submit never returned after the buffer drained")
+	}
+
+	done() // shut down so every accepted task is accounted for below
+
+	if got := processed.Load(); got != 3 {
+		t.Errorf("processed %d tasks, want 3 (occupy, fill, blocked)", got)
+	}
+}
+
+// A wait that runs out is still a full buffer, so it surfaces as ErrBufferFull
+// rather than context.DeadlineExceeded — callers keep one sentinel whether or
+// not WithBlockOnFull is set.
+func TestWithBlockOnFull_TimeoutReportsErrBufferFull(t *testing.T) {
+	const maxWait = 40 * time.Millisecond
+	p, _, _, done := blockedPool(t, WithBlockOnFull(maxWait))
+	defer done()
+
+	start := time.Now()
+	err := p.Submit(context.Background(), Task{ID: "blocked"})
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrBufferFull) {
+		t.Errorf("Submit err = %v, want ErrBufferFull", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Error("the internal wait deadline must not leak to the caller as a context error")
+	}
+	if elapsed < maxWait {
+		t.Errorf("Submit returned after %s, want it to wait at least %s", elapsed, maxWait)
+	}
+}
+
+// The caller's own cancellation is not a full buffer: it must surface as the
+// ctx error so a cancelled request is distinguishable from a saturated pool.
+func TestWithBlockOnFull_CallerCancelReportsCtxErr(t *testing.T) {
+	p, _, _, done := blockedPool(t, WithBlockOnFull(5*time.Second))
+	defer done()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(30*time.Millisecond, cancel)
+
+	err := p.Submit(ctx, Task{ID: "blocked"})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Submit err = %v, want context.Canceled", err)
+	}
+	if errors.Is(err, ErrBufferFull) {
+		t.Error("a cancelled caller must not be reported as ErrBufferFull")
+	}
+}
+
+// maxWait <= 0 means "bounded only by the caller's ctx", and that deadline is
+// the caller's own, so it is reported as such.
+func TestWithBlockOnFull_ZeroMaxWaitUsesCallerDeadline(t *testing.T) {
+	p, _, _, done := blockedPool(t, WithBlockOnFull(0))
+	defer done()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+
+	if err := p.Submit(ctx, Task{ID: "blocked"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Submit err = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+// Without the option Submit keeps its non-blocking contract.
+func TestSubmit_WithoutBlockOnFullStaysNonBlocking(t *testing.T) {
+	p, _, _, done := blockedPool(t)
+	defer done()
+
+	start := time.Now()
+	err := p.Submit(context.Background(), Task{ID: "blocked"})
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrBufferFull) {
+		t.Errorf("Submit err = %v, want ErrBufferFull", err)
+	}
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("Submit took %s; the default path must not wait for room", elapsed)
+	}
+}
+
+// An already-cancelled ctx is rejected before the task is stamped or enqueued,
+// with or without blocking.
+func TestWithBlockOnFull_CancelledCtxRejectedUpFront(t *testing.T) {
+	p := NewPool(func(context.Context, any) error { return nil }, WithBlockOnFull(time.Second))
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { collectResults(p) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := p.Submit(ctx, Task{ID: "t1"}); !errors.Is(err, context.Canceled) {
+		t.Errorf("Submit err = %v, want context.Canceled", err)
+	}
+
+	p.CloseAndWait()
+	wg.Wait()
+}
+
+// A task whose wait ran out was never enqueued, so its write-ahead record must
+// be compensated — otherwise it would replay as pending after a restart.
+func TestWithBlockOnFull_TimeoutLeavesNoPendingRecord(t *testing.T) {
+	store := newMemStore()
+	p, _, _, done := blockedPool(t, WithBlockOnFull(30*time.Millisecond), WithStore(store))
+
+	if err := p.Submit(context.Background(), Task{ID: "blocked"}); !errors.Is(err, ErrBufferFull) {
+		t.Fatalf("Submit err = %v, want ErrBufferFull", err)
+	}
+
+	done() // drains every enqueued task and flushes the store writer
+
+	if n := store.len(); n != 0 {
+		t.Errorf("store holds %d pending records after shutdown, want 0", n)
+	}
+	if _, ok := store.pending["blocked"]; ok {
+		t.Error("the task that never got a buffer slot left an orphan pending record")
+	}
+}
+
+// In aggregating mode Submit folds into an in-memory accumulator and never
+// touches a lane, so blocking has nothing to block on.
+func TestWithBlockOnFull_NoOpUnderAggregator(t *testing.T) {
+	var sum atomic.Int64
+	merge := func(a, b any) any { return a.(int) + b.(int) }
+
+	p := NewPool(func(_ context.Context, payload any) error {
+		sum.Add(int64(payload.(int)))
+		return nil
+	},
+		WithBufferSize(1),
+		WithWorkerCount(1),
+		WithRetryPolicy(fastPolicy(1)),
+		WithAggregator(merge, 10*time.Millisecond, 128),
+		WithBlockOnFull(10*time.Millisecond),
+	)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { drain(p) })
+
+	// Far more submissions than the buffer holds: none may be rejected or
+	// delayed, because they coalesce in memory instead of queueing.
+	const n = 500
+	for i := range n {
+		if err := p.Submit(context.Background(), Task{ID: fmt.Sprintf("t-%d", i), Key: "k", Payload: 1}); err != nil {
+			t.Fatalf("Submit(%d) under aggregator: %v", i, err)
+		}
+	}
+
+	p.CloseAndWait()
+	wg.Wait()
+
+	if got := sum.Load(); got != n {
+		t.Errorf("coalesced sum = %d, want %d", got, n)
+	}
+}
+
+func TestWithBlockOnFullOptionDefaults(t *testing.T) {
+	if p := newPool(); p.blockOnFull {
+		t.Error("blockOnFull must default to false, keeping Submit non-blocking")
+	}
+	p := newPool(WithBlockOnFull(250 * time.Millisecond))
+	if !p.blockOnFull {
+		t.Error("WithBlockOnFull did not enable blocking")
+	}
+	if p.submitWait != 250*time.Millisecond {
+		t.Errorf("submitWait = %s, want 250ms", p.submitWait)
+	}
+}
+
+// --- Submit vs CloseAndWait ---
+
+// A Submit parked on a full lane must be released by CloseAndWait, not left to
+// send on a lane that shutdown is about to close.
+func TestCloseAndWait_ReleasesParkedSubmit(t *testing.T) {
+	p, release, _, done := blockedPool(t, WithBlockOnFull(10*time.Second))
+
+	errc := make(chan error, 1)
+	go func() { errc <- p.Submit(context.Background(), Task{ID: "parked"}) }()
+
+	// Make sure the submitter is actually parked before shutting down, so the
+	// test exercises the release path rather than the already-closed check.
+	select {
+	case err := <-errc:
+		t.Fatalf("Submit returned %v before shutdown; want it parked", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	release() // let the workers drain so CloseAndWait can finish
+	closed := make(chan struct{})
+	go func() {
+		done() // closes stopSubmit, then waits out the in-flight submitter
+		close(closed)
+	}()
+
+	select {
+	case err := <-errc:
+		// Either outcome is correct: the lane may free up before shutdown shuts
+		// the submit path down. What must never happen is a panic or a hang.
+		if err != nil && !errors.Is(err, ErrPoolClosed) {
+			t.Errorf("parked Submit err = %v, want nil or ErrPoolClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("parked Submit never returned after CloseAndWait")
+	}
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseAndWait never returned; shutdown is stuck behind a submitter")
+	}
+}
+
+// Submitting once the pool is closed is an error, not a panic on a closed lane.
+func TestSubmit_AfterCloseReturnsErrPoolClosed(t *testing.T) {
+	p := NewPool(func(context.Context, any) error { return nil }, WithRetryPolicy(fastPolicy(1)))
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { collectResults(p) })
+
+	if err := p.Submit(context.Background(), Task{ID: "before"}); err != nil {
+		t.Fatalf("Submit before close: %v", err)
+	}
+	p.CloseAndWait()
+	wg.Wait()
+
+	if err := p.Submit(context.Background(), Task{ID: "after"}); !errors.Is(err, ErrPoolClosed) {
+		t.Errorf("Submit after CloseAndWait = %v, want ErrPoolClosed", err)
+	}
+}
+
+// The same, with blocking enabled: a post-shutdown Submit must fail fast rather
+// than park for maxWait on a lane nobody will ever drain.
+func TestSubmit_AfterCloseWithBlockOnFullDoesNotWait(t *testing.T) {
+	p := NewPool(func(context.Context, any) error { return nil },
+		WithRetryPolicy(fastPolicy(1)),
+		WithBlockOnFull(5*time.Second),
+	)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { collectResults(p) })
+	p.CloseAndWait()
+	wg.Wait()
+
+	start := time.Now()
+	err := p.Submit(context.Background(), Task{ID: "after"})
+	if !errors.Is(err, ErrPoolClosed) {
+		t.Errorf("Submit after CloseAndWait = %v, want ErrPoolClosed", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Submit waited %s on a closed pool; want an immediate refusal", elapsed)
+	}
+}
+
+// Producers racing shutdown must never panic, deadlock, or trip the race
+// detector — the failure mode this latch exists to prevent.
+func TestSubmit_ConcurrentWithCloseAndWait(t *testing.T) {
+	for range 20 {
+		p := NewPool(func(context.Context, any) error { return nil },
+			WithBufferSize(4),
+			WithWorkerCount(2),
+			WithRetryPolicy(fastPolicy(1)),
+			WithBlockOnFull(50*time.Millisecond),
+		)
+		if err := p.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Go(func() { collectResults(p) })
+
+		var producers sync.WaitGroup
+		for i := range 8 {
+			producers.Go(func() {
+				for j := range 50 {
+					err := p.Submit(context.Background(), Task{ID: fmt.Sprintf("t-%d-%d", i, j)})
+					// Any error is acceptable during a shutdown race; a panic is not.
+					if err != nil && !errors.Is(err, ErrPoolClosed) && !errors.Is(err, ErrBufferFull) {
+						t.Errorf("Submit err = %v, want nil, ErrPoolClosed or ErrBufferFull", err)
+						return
+					}
+				}
+			})
+		}
+
+		p.CloseAndWait()
+		producers.Wait()
+		wg.Wait()
+	}
+}

@@ -145,9 +145,12 @@ else when:
 ### Lifecycle
 
 - `Submit` returns `ErrBufferFull` immediately when the job buffer is full (non-blocking),
-  or the context error if `ctx` is cancelled.
+  or the context error if `ctx` is cancelled. With `WithBlockOnFull` it waits for room
+  instead — see [Backpressure](#backpressure-waiting-instead-of-dropping).
 - `CloseAndWait` stops accepting work, waits for in-flight tasks to finish, then closes the
   `Results()` channel. Cancelling the `ctx` passed to `Start` stops workers without draining.
+  It is safe to call while producers are still submitting: a `Submit` that races or follows
+  shutdown returns `ErrPoolClosed` and its task is not enqueued.
 
 ## Options
 
@@ -173,6 +176,7 @@ pool := quelon.NewPool(process,
 |--------|--------|
 | `WithBufferSize(n)` | Job buffer capacity. Default: `runtime.NumCPU()*10`. |
 | `WithWorkerCount(n)` | Number of workers. Default: `runtime.NumCPU()`. |
+| `WithBlockOnFull(maxWait)` | `Submit` waits up to `maxWait` for buffer room instead of rejecting (see below). Off by default. |
 | `WithRetryPolicy(r)` | Exponential backoff config. Default: 3 attempts, 200ms base, 10s cap. |
 | `WithTaskTimeout(d)` | Per-attempt context timeout. Default 30s. |
 | `WithHooks(h)` | Success / retry / dead-letter / store-error callbacks. |
@@ -187,6 +191,45 @@ pool := quelon.NewPool(process,
 | `WithMaxBatchSize(n)` | Max tasks per batch (`NewPoolWithBatch` only). Default: 10. |
 | `WithMaxBatchWait(d)` | Max wait to fill a batch. 0 = best-effort (`NewPoolWithBatch` only). |
 | `WithAggregator(merge, every, maxKeys)` | Fold same-key Submits in memory, flush one coalesced task per key every `every` (or at `maxKeys`). See below. |
+
+## Backpressure: waiting instead of dropping
+
+By default a full buffer means `Submit` rejects the task — the producer must decide what to
+do with it, and a producer that only logs the error is dropping work:
+
+```go
+if err := pool.Submit(ctx, task); err != nil {
+	log.Printf("submit failed: %v", err) // task is gone
+}
+```
+
+`WithBlockOnFull` makes `Submit` wait for room instead, bounded by `maxWait`:
+
+```go
+pool := quelon.NewPool(process,
+	quelon.WithBufferSize(1024),
+	quelon.WithBlockOnFull(100*time.Millisecond), // 0 = wait until ctx is done
+)
+```
+
+A wait that runs out is still reported as `ErrBufferFull`, not `context.DeadlineExceeded`,
+so `errors.Is(err, quelon.ErrBufferFull)` call sites work whether or not the option is set.
+Cancelling the caller's own `ctx` is still reported as that ctx's error, so a cancelled
+request stays distinguishable from a saturated pool.
+
+Understand the trade: a full buffer means the workers are behind, so waiting moves that
+backlog onto the calling goroutine. It absorbs **bursts**; it cannot fix an arrival rate
+that exceeds the drain rate. On a request hot path keep `maxWait` small — tens to low
+hundreds of milliseconds — so saturation degrades into a rejected submit rather than a
+stalled handler. Waiting also does not make enqueue durable: if losing a task is
+unacceptable even across a crash, write it in the same transaction as the state change it
+follows and submit from that record (see
+[When not to use quelon](#when-not-to-use-quelon)).
+
+Producers may race `CloseAndWait` freely. Shutdown shuts the submit path down first and
+waits for any in-flight — or parked — submitter to leave before it closes the lanes, so a
+`Submit` is never left sending on a closed channel. Those calls, and any that arrive after
+shutdown, return `ErrPoolClosed`; their tasks were not enqueued and will not run.
 
 ## Retries and dead-lettering
 
