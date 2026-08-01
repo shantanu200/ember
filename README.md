@@ -406,6 +406,21 @@ pool.Start(ctx)
 pool.Submit(ctx, quelon.Task{ID: "batch-created-" + id, Key: id, Payload: BatchCreated{...}})
 ```
 
+`Handle` takes a `ProcessFunc`, so handlers receive `any` and every one of them opens with a
+type assertion. `quelon.On` is the typed form — same routing, same fan-out, no assertion:
+
+```go
+func (s *FacultyService) OnBatchCreated(ctx context.Context, ev BatchCreated) error { ... }
+
+quelon.On(mux, facultySvc.OnBatchCreated)
+quelon.On(mux, subjectSvc.OnBatchCreated)
+```
+
+`On` is a function rather than a method because Go methods cannot take type parameters. Its
+type parameter must be the **value** type (`BatchCreated`, not `*BatchCreated`) — the same
+rule `Event` already imposes for store replay. `On` panics at registration on a pointer or
+interface type rather than dead-lettering every such event at runtime.
+
 `Mux` also dissolves the construction cycle you hit when a handler's dependencies need the
 pool (to `Submit`) while the pool needs the handler (to process): `mux.Process` is a stable
 method the moment `NewMux()` returns, so you pass it to `NewPool` up front and register

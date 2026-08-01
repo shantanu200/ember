@@ -139,6 +139,168 @@ func TestMux_PointerPayloadNormalizedToValue(t *testing.T) {
 	}
 }
 
+// --- On (typed handlers) ---
+
+func TestOn_RoutesTypedEvent(t *testing.T) {
+	var gotCreated batchCreated
+	var gotDeleted batchDeleted
+
+	m := NewMux()
+	On(m, func(_ context.Context, ev batchCreated) error { gotCreated = ev; return nil })
+	On(m, func(_ context.Context, ev batchDeleted) error { gotDeleted = ev; return nil })
+
+	want := batchCreated{BatchID: "b1", Subjects: []string{"math"}}
+	if err := m.Process(context.Background(), want); err != nil {
+		t.Fatalf("Process(created): %v", err)
+	}
+	if err := m.Process(context.Background(), batchDeleted{BatchID: "b2"}); err != nil {
+		t.Fatalf("Process(deleted): %v", err)
+	}
+
+	if !reflect.DeepEqual(gotCreated, want) {
+		t.Errorf("created handler got %+v, want %+v", gotCreated, want)
+	}
+	if gotDeleted.BatchID != "b2" {
+		t.Errorf("deleted handler got %q, want b2", gotDeleted.BatchID)
+	}
+}
+
+// On must share one registry with Handle: typed and untyped handlers for the
+// same event fan out together, in registration order.
+func TestOn_FansOutWithHandle(t *testing.T) {
+	var order []string
+
+	m := NewMux()
+	On(m, func(_ context.Context, _ batchCreated) error { order = append(order, "typed"); return nil })
+	m.Handle(batchCreated{}, func(_ context.Context, _ any) error { order = append(order, "untyped"); return nil })
+
+	if err := m.Process(context.Background(), batchCreated{}); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if want := []string{"typed", "untyped"}; !reflect.DeepEqual(order, want) {
+		t.Errorf("fan-out order = %v, want %v", order, want)
+	}
+}
+
+// A handler error must reach the pool unwrapped so RetryPolicy applies; the
+// typed wrapper must not mark it permanent.
+func TestOn_HandlerErrorStaysTransient(t *testing.T) {
+	boom := errors.New("boom")
+	m := NewMux()
+	On(m, func(_ context.Context, _ batchCreated) error { return boom })
+
+	err := m.Process(context.Background(), batchCreated{})
+	if !errors.Is(err, boom) {
+		t.Errorf("got err %v, want boom", err)
+	}
+	if IsPermanent(err) {
+		t.Error("a typed handler's transient error must not be marked permanent")
+	}
+}
+
+// Process normalizes a pointer payload to its value form, so a typed handler
+// registered for the value type still receives it.
+func TestOn_PointerPayloadReachesValueHandler(t *testing.T) {
+	var got batchCreated
+	m := NewMux()
+	On(m, func(_ context.Context, ev batchCreated) error { got = ev; return nil })
+
+	if err := m.Process(context.Background(), &batchCreated{BatchID: "b1"}); err != nil {
+		t.Fatalf("Process(pointer): %v", err)
+	}
+	if got.BatchID != "b1" {
+		t.Errorf("handler got %+v, want BatchID b1", got)
+	}
+}
+
+// A pointer type parameter would register a tag it can never match after store
+// replay (decode yields values), so On rejects it loudly at registration
+// instead of dead-lettering every event at runtime.
+func TestOn_PointerTypeParamPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("On with a pointer type parameter must panic")
+		}
+	}()
+
+	m := NewMux()
+	On(m, func(_ context.Context, _ *batchCreated) error { return nil })
+}
+
+func TestOn_InterfaceTypeParamPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("On with an interface type parameter must panic")
+		}
+	}()
+
+	m := NewMux()
+	On(m, func(_ context.Context, _ Event) error { return nil })
+}
+
+// On must register the concrete type for the codec too, so events registered
+// only through On still replay into their concrete type after a restart.
+func TestOn_RegistersTypeForCodec(t *testing.T) {
+	m := NewMux()
+	On(m, func(_ context.Context, _ batchCreated) error { return nil })
+	p := m.NewPool()
+
+	orig := batchCreated{BatchID: "b1", Subjects: []string{"math", "science"}}
+	encoded, err := p.encode(orig)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := p.decode(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got, ok := decoded.(batchCreated)
+	if !ok {
+		t.Fatalf("decoded payload is %T, want batchCreated", decoded)
+	}
+	if !reflect.DeepEqual(got, orig) {
+		t.Errorf("round-trip = %+v, want %+v", got, orig)
+	}
+	// And the decoded value must route back through the typed handler.
+	if err := m.Process(context.Background(), decoded); err != nil {
+		t.Errorf("Process(decoded): %v", err)
+	}
+}
+
+func TestOn_EndToEndWithPool(t *testing.T) {
+	var faculty, subject atomic.Int64
+
+	m := NewMux()
+	p := m.NewPool(WithWorkerCount(4), WithRetryPolicy(fastPolicy(1)))
+	On(m, func(_ context.Context, ev batchCreated) error {
+		if ev.BatchID != "b" {
+			t.Errorf("handler got BatchID %q, want b", ev.BatchID)
+		}
+		faculty.Add(1)
+		return nil
+	})
+	On(m, func(_ context.Context, _ batchCreated) error { subject.Add(1); return nil })
+
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 10
+	var wg sync.WaitGroup
+	wg.Go(func() { collectResults(p) })
+	for i := range n {
+		if err := p.Submit(context.Background(), Task{ID: "batch-" + string(rune('a'+i)), Payload: batchCreated{BatchID: "b"}}); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+	}
+	p.CloseAndWait()
+	wg.Wait()
+
+	if faculty.Load() != n || subject.Load() != n {
+		t.Errorf("faculty=%d subject=%d, want %d each", faculty.Load(), subject.Load(), n)
+	}
+}
+
 // --- codec (persistence round-trip) ---
 
 func TestMux_CodecRoundTrip(t *testing.T) {
