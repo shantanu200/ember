@@ -1373,3 +1373,128 @@ func TestWithBlockOnFullOptionDefaults(t *testing.T) {
 		t.Errorf("submitWait = %s, want 250ms", p.submitWait)
 	}
 }
+
+// --- Submit vs CloseAndWait ---
+
+// A Submit parked on a full lane must be released by CloseAndWait, not left to
+// send on a lane that shutdown is about to close.
+func TestCloseAndWait_ReleasesParkedSubmit(t *testing.T) {
+	p, release, _, done := blockedPool(t, WithBlockOnFull(10*time.Second))
+
+	errc := make(chan error, 1)
+	go func() { errc <- p.Submit(context.Background(), Task{ID: "parked"}) }()
+
+	// Make sure the submitter is actually parked before shutting down, so the
+	// test exercises the release path rather than the already-closed check.
+	select {
+	case err := <-errc:
+		t.Fatalf("Submit returned %v before shutdown; want it parked", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	release() // let the workers drain so CloseAndWait can finish
+	closed := make(chan struct{})
+	go func() {
+		done() // closes stopSubmit, then waits out the in-flight submitter
+		close(closed)
+	}()
+
+	select {
+	case err := <-errc:
+		// Either outcome is correct: the lane may free up before shutdown shuts
+		// the submit path down. What must never happen is a panic or a hang.
+		if err != nil && !errors.Is(err, ErrPoolClosed) {
+			t.Errorf("parked Submit err = %v, want nil or ErrPoolClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("parked Submit never returned after CloseAndWait")
+	}
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseAndWait never returned; shutdown is stuck behind a submitter")
+	}
+}
+
+// Submitting once the pool is closed is an error, not a panic on a closed lane.
+func TestSubmit_AfterCloseReturnsErrPoolClosed(t *testing.T) {
+	p := NewPool(func(context.Context, any) error { return nil }, WithRetryPolicy(fastPolicy(1)))
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { collectResults(p) })
+
+	if err := p.Submit(context.Background(), Task{ID: "before"}); err != nil {
+		t.Fatalf("Submit before close: %v", err)
+	}
+	p.CloseAndWait()
+	wg.Wait()
+
+	if err := p.Submit(context.Background(), Task{ID: "after"}); !errors.Is(err, ErrPoolClosed) {
+		t.Errorf("Submit after CloseAndWait = %v, want ErrPoolClosed", err)
+	}
+}
+
+// The same, with blocking enabled: a post-shutdown Submit must fail fast rather
+// than park for maxWait on a lane nobody will ever drain.
+func TestSubmit_AfterCloseWithBlockOnFullDoesNotWait(t *testing.T) {
+	p := NewPool(func(context.Context, any) error { return nil },
+		WithRetryPolicy(fastPolicy(1)),
+		WithBlockOnFull(5*time.Second),
+	)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { collectResults(p) })
+	p.CloseAndWait()
+	wg.Wait()
+
+	start := time.Now()
+	err := p.Submit(context.Background(), Task{ID: "after"})
+	if !errors.Is(err, ErrPoolClosed) {
+		t.Errorf("Submit after CloseAndWait = %v, want ErrPoolClosed", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Submit waited %s on a closed pool; want an immediate refusal", elapsed)
+	}
+}
+
+// Producers racing shutdown must never panic, deadlock, or trip the race
+// detector — the failure mode this latch exists to prevent.
+func TestSubmit_ConcurrentWithCloseAndWait(t *testing.T) {
+	for range 20 {
+		p := NewPool(func(context.Context, any) error { return nil },
+			WithBufferSize(4),
+			WithWorkerCount(2),
+			WithRetryPolicy(fastPolicy(1)),
+			WithBlockOnFull(50*time.Millisecond),
+		)
+		if err := p.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Go(func() { collectResults(p) })
+
+		var producers sync.WaitGroup
+		for i := range 8 {
+			producers.Go(func() {
+				for j := range 50 {
+					err := p.Submit(context.Background(), Task{ID: fmt.Sprintf("t-%d-%d", i, j)})
+					// Any error is acceptable during a shutdown race; a panic is not.
+					if err != nil && !errors.Is(err, ErrPoolClosed) && !errors.Is(err, ErrBufferFull) {
+						t.Errorf("Submit err = %v, want nil, ErrPoolClosed or ErrBufferFull", err)
+						return
+					}
+				}
+			})
+		}
+
+		p.CloseAndWait()
+		producers.Wait()
+		wg.Wait()
+	}
+}

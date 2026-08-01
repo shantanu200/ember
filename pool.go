@@ -63,6 +63,16 @@ type Pool struct {
 	superDone      chan struct{} // closed when the supervisor goroutine exits
 	closing        chan struct{} // closed by CloseAndWait to release workers blocked emitting results
 
+	// Submitter latch. A submitter sending on a lane must not race the
+	// CloseAndWait that closes it, or the send panics. Submit holds submitMu for
+	// reading across its send; CloseAndWait closes stopSubmit (releasing any
+	// submitter parked on a full lane), then takes the write lock to wait for
+	// every in-flight send to leave, and sets submitClosed so later Submits fail
+	// with ErrPoolClosed instead of touching a closed channel.
+	submitMu     sync.RWMutex
+	submitClosed bool
+	stopSubmit   chan struct{}
+
 	bufferSize  int // set via WithBufferSize; defaults to runtime.NumCPU()*10
 	workerCount int // set via WithWorkerCount; defaults to runtime.NumCPU()
 
@@ -211,9 +221,10 @@ func WithBufferSize(n int) Option {
 //
 // Submit still reports a wait that ran out as ErrBufferFull, so existing
 // errors.Is(err, ErrBufferFull) call sites keep working unchanged. Cancellation
-// of the caller's own ctx is still reported as that ctx's error. Blocking has
-// no effect in aggregating mode (WithAggregator), where Submit folds in memory
-// and never touches a lane.
+// of the caller's own ctx is still reported as that ctx's error, and a waiter
+// released by CloseAndWait gets ErrPoolClosed. Blocking has no effect in
+// aggregating mode (WithAggregator), where Submit folds in memory and never
+// touches a lane.
 func WithBlockOnFull(maxWait time.Duration) Option {
 	return func(p *Pool) {
 		p.blockOnFull = true
@@ -408,6 +419,7 @@ func newPool(opts ...Option) *Pool {
 		quit:          make(chan struct{}),
 		superDone:     make(chan struct{}),
 		closing:       make(chan struct{}),
+		stopSubmit:    make(chan struct{}),
 		writerDone:    make(chan struct{}),
 	}
 
@@ -586,10 +598,10 @@ func (p *Pool) Start(ctx context.Context) error {
 // unset, t.EnqueuedAt; callers should not rely on either field surviving a
 // Submit call unchanged.
 //
-// Safe for concurrent use by multiple goroutines, but no Submit may be in
-// flight when CloseAndWait runs — shutdown closes the lanes a submitter sends
-// on. With WithBlockOnFull a submitter can be parked inside Submit for as long
-// as maxWait, so stop producers (or cancel their ctx) before closing the pool.
+// Safe for concurrent use by multiple goroutines, and safe to race
+// CloseAndWait: a Submit that arrives once shutdown has begun returns
+// ErrPoolClosed, and one already parked on a full lane is released with the
+// same error rather than being left to send on a closed lane.
 func (p *Pool) Submit(ctx context.Context, t Task) error {
 	// Checked up front so an already-cancelled ctx is honoured either way: the
 	// non-blocking path has no ctx.Done() select case at all, and on the blocking
@@ -597,6 +609,14 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 	// the two at random.
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	// Held across the whole submission: CloseAndWait cannot close the lanes out
+	// from under an in-flight send while any reader holds this.
+	p.submitMu.RLock()
+	defer p.submitMu.RUnlock()
+	if p.submitClosed {
+		return ErrPoolClosed
 	}
 
 	if t.EnqueuedAt.IsZero() {
@@ -617,7 +637,7 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 	t.Seq = p.seq.Add(1)
 
 	if !p.blockOnFull {
-		return p.dispatch(ctx, t, false)
+		return p.dispatch(ctx, t, false, p.stopSubmit)
 	}
 
 	waitCtx := ctx
@@ -626,7 +646,7 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 		waitCtx, cancel = context.WithTimeout(ctx, p.submitWait)
 		defer cancel()
 	}
-	err := p.dispatch(waitCtx, t, true)
+	err := p.dispatch(waitCtx, t, true, p.stopSubmit)
 	// Distinguish "we gave up waiting" from "the caller went away": only the
 	// former is a full buffer. Reporting it as ErrBufferFull rather than
 	// context.DeadlineExceeded keeps the blocking and non-blocking modes on one
@@ -638,11 +658,16 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 }
 
 // dispatch persists t (write-ahead, if enabled) and enqueues it onto its lane.
-// With block=false (a normal Submit) a full lane is reported immediately as
-// ErrBufferFull; with block=true (an aggregator flush of an already-coalesced
-// value standing in for many events) it waits for lane room, releasing only on
-// ctx cancellation or pool shutdown so the value is not dropped on a transient
-// full buffer.
+// With block=false (a non-blocking Submit) a full lane is reported immediately
+// as ErrBufferFull; with block=true (a Submit under WithBlockOnFull, or an
+// aggregator flush of an already-coalesced value standing in for many events)
+// it waits for lane room so the task is not dropped on a transient full buffer.
+//
+// release, when non-nil, is an extra channel whose closing abandons the wait
+// with ErrPoolClosed. Submit passes p.stopSubmit so a parked submitter leaves
+// before CloseAndWait closes the lanes; the aggregator's own flush passes nil,
+// because it runs after submitters are shut out and must still deliver its
+// coalesced values onto the lanes.
 //
 // The save is queued before the send. The task can't be picked up — and so
 // can't have its completion delete queued — until it is on the lane, so the
@@ -651,7 +676,7 @@ func (p *Pool) Submit(ctx context.Context, t Task) error {
 // leaving a durable pending record for an already-finished task that would
 // wrongly replay on restart. A save for a task that is ultimately not enqueued
 // is compensated with a delete so no orphan pending record remains.
-func (p *Pool) dispatch(ctx context.Context, t Task, block bool) error {
+func (p *Pool) dispatch(ctx context.Context, t Task, block bool, release <-chan struct{}) error {
 	persisted := false
 	if p.persistPending {
 		encoded, err := p.encode(t.Payload)
@@ -695,6 +720,13 @@ func (p *Pool) dispatch(ctx context.Context, t Task, block bool) error {
 			p.queueOp(storeOp{kind: opDelete, id: t.ID})
 		}
 		return ctx.Err()
+	case <-release:
+		// Shutdown has begun. Leave now, while the lane is still open, so
+		// CloseAndWait's write lock can proceed and close it safely.
+		if persisted {
+			p.queueOp(storeOp{kind: opDelete, id: t.ID})
+		}
+		return ErrPoolClosed
 	case <-p.closing:
 		if persisted {
 			p.queueOp(storeOp{kind: opDelete, id: t.ID})
@@ -743,7 +775,21 @@ func (p *Pool) Results() <-chan Result {
 // complete, so every task outcome submitted before this call is observed
 // (via hooks and, if configured, the store) before CloseAndWait returns. Call
 // it exactly once, typically deferred right after a successful Start.
+//
+// Concurrent Submits are safe: shutdown first shuts the submit path down and
+// waits for any in-flight (or, under WithBlockOnFull, parked) submitter to
+// leave, so no one is left sending on a lane this closes. Those calls, and any
+// that arrive afterwards, return ErrPoolClosed.
 func (p *Pool) CloseAndWait() {
+	// Order matters. Closing stopSubmit releases submitters parked on a full
+	// lane; taking the write lock then waits for every in-flight send to finish.
+	// Only once no submitter can be inside dispatch is it safe to close the
+	// lanes below — a send on a closed channel panics.
+	close(p.stopSubmit)
+	p.submitMu.Lock()
+	p.submitClosed = true
+	p.submitMu.Unlock()
+
 	if p.dynamic {
 		// Stop the supervisor before closing jobs so it can't call wg.Add
 		// concurrently with the wg.Wait below.

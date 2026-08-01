@@ -149,6 +149,8 @@ else when:
   instead — see [Backpressure](#backpressure-waiting-instead-of-dropping).
 - `CloseAndWait` stops accepting work, waits for in-flight tasks to finish, then closes the
   `Results()` channel. Cancelling the `ctx` passed to `Start` stops workers without draining.
+  It is safe to call while producers are still submitting: a `Submit` that races or follows
+  shutdown returns `ErrPoolClosed` and its task is not enqueued.
 
 ## Options
 
@@ -224,10 +226,10 @@ unacceptable even across a crash, write it in the same transaction as the state 
 follows and submit from that record (see
 [When not to use quelon](#when-not-to-use-quelon)).
 
-Because a blocked `Submit` can be parked for up to `maxWait`, no `Submit` may be in flight
-when `CloseAndWait` runs — shutdown closes the lanes a submitter sends on. Stop producers,
-or cancel their `ctx`, before closing the pool. (This is true of the non-blocking default
-too; blocking just widens the window.)
+Producers may race `CloseAndWait` freely. Shutdown shuts the submit path down first and
+waits for any in-flight — or parked — submitter to leave before it closes the lanes, so a
+`Submit` is never left sending on a closed channel. Those calls, and any that arrive after
+shutdown, return `ErrPoolClosed`; their tasks were not enqueued and will not run.
 
 ## Retries and dead-lettering
 

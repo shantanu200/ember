@@ -67,6 +67,12 @@ func IsPermanent(err error) bool {
 // partitioned mode, the task's lane) has no room and the task was rejected.
 var ErrBufferFull = errors.New("quelon: job buffer full")
 
+// ErrPoolClosed is returned by Submit when CloseAndWait has begun: either the
+// call arrived after shutdown started, or it was waiting for buffer room (see
+// WithBlockOnFull) when shutdown began and was released. The task was not
+// enqueued and will not be processed.
+var ErrPoolClosed = errors.New("quelon: pool closed")
+
 // DefaultRetryPolicy is used by NewPool/NewPoolWithBatch when no
 // WithRetryPolicy option is supplied: 3 attempts, 200ms base delay doubling
 // up to a 10s cap, no jitter.

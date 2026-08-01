@@ -205,8 +205,10 @@ func (a *aggregator) flushAll(ctx context.Context) {
 			}
 			// A coalesced value stands in for many Submits, so wait for lane room
 			// rather than dropping it on a transient full buffer. dispatch releases
-			// on ctx cancellation or pool shutdown.
-			_ = a.p.dispatch(ctx, task, true)
+			// on ctx cancellation or pool shutdown. No release channel: the final
+			// flush runs after CloseAndWait has shut submitters out but before the
+			// lanes close, and must still deliver onto them.
+			_ = a.p.dispatch(ctx, task, true, nil)
 		}
 	}
 }
